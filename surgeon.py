@@ -469,25 +469,28 @@ class XlsxSurgeon:
             col, row = split_ref(ref)
             by_row.setdefault(row, {})[col] = val
 
-        for row_num, colvals in sorted(by_row.items()):
-            row_re = re.compile(r'<row r="%d"(?:\s[^>]*)?(?:/>|>.*?</row>)' % row_num,
-                                re.S)
-            m = row_re.search(xml)
-            if m:
-                xml = xml[:m.start()] + self._rebuild_row(m.group(0), row_num, colvals) + xml[m.end():]
-            else:
-                # insert a new row in ascending position
-                new = f'<row r="{row_num}">' + "".join(
-                    cell_xml(f"{c}{row_num}", v) for c, v in
-                    sorted(colvals.items(), key=lambda kv: col_index(kv[0]))) + "</row>"
-                inserted = False
-                for mm in re.finditer(r'<row r="(\d+)"', xml):
-                    if int(mm.group(1)) > row_num:
-                        xml = xml[:mm.start()] + new + xml[mm.start():]
-                        inserted = True
-                        break
-                if not inserted:
-                    xml = xml.replace("</sheetData>", new + "</sheetData>", 1)
+        open_m = re.search(r"<sheetData>", xml)
+        close_i = xml.rfind("</sheetData>")
+        if not open_m or close_i == -1:
+            raise ValueError("sheetData not found for set_cells")
+        head, body, tail = xml[:open_m.end()], xml[open_m.end():close_i], xml[close_i:]
+
+        # ONE pass over the body to locate every existing row, then O(1) dict
+        # lookups per target row and a SINGLE final join — mirrors _apply_paste.
+        # The previous version re-ran regex.search(xml) from scratch and
+        # re-sliced the whole string PER ROW: for 16,362 AR rows (one formula
+        # cell each) that is quadratic in document size and is what stalled a
+        # real run in "surgery" for the better part of an hour on Render.
+        row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*)?(?:/>|>.*?</row>)', re.S)
+        existing = {int(m.group(1)): m.group(0) for m in row_re.finditer(body)}
+
+        out_rows = dict(existing)
+        for row_num, colvals in by_row.items():
+            base = existing.get(row_num, f'<row r="{row_num}"></row>')
+            out_rows[row_num] = self._rebuild_row(base, row_num, colvals)
+
+        new_body = "".join(out_rows[k] for k in sorted(out_rows))
+        xml = head + new_body + tail
 
         # every ref we wrote a value into must actually be in the result
         # (None/"" deletes the cell, so those refs are exempt)
