@@ -167,7 +167,11 @@ def _probe_formulas(src: str, probes: list[dict]) -> dict:
             cells = {}
             for m in re.finditer(
                     r'<c r="([A-Z]+\d+)"[^>]*>\s*<f[^>]*>(.*?)</f>', row_xml, re.S):
-                cells[m.group(1)] = "=" + re.sub(r"\s+", " ", m.group(2)).strip()
+                f = re.sub(r"\s+", " ", m.group(2)).strip()
+                for ent, ch in (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'),
+                                ("&apos;", "'"), ("&amp;", "&")):
+                    f = f.replace(ent, ch)
+                cells[m.group(1)] = "=" + f
             out["formulas"][f"{sheet}!r{row}"] = cells
     return out
 
@@ -274,7 +278,7 @@ def _run(job_id: str, job: Job):
                 pass
 
 
-VERSION = "2026-08-17-extract-v2"
+VERSION = "2026-08-17-extract-v3"
 
 
 @app.get("/health")
