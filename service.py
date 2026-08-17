@@ -85,6 +85,31 @@ class Job(BaseModel):
     stageOrder: list[str] | None = None
     # optional formula probe: [{"sheet": "AR_06.30", "row": 7}, ...]
     probe: list[dict] | None = None
+    # keep the output on disk and serve it at GET /jobs/{id}/result
+    # (testing aid — the file survives until the next restart/redeploy)
+    keepResult: bool = False
+
+
+def _auto_probes(job: "Job") -> list[dict]:
+    """When an extract runs, probe the formula rows the templates must be
+    read from: the dup-source AR sheet and the sales/raw target sheets at
+    their anchor rows. Reported in job['formulaProbe'] so a real run hands
+    back the workbook's actual formulas."""
+    probes = {(p.get("sheet"), int(p.get("row", 0))) for p in (job.probe or [])}
+    ext = job.extract or {}
+
+    def row_of(block):
+        m = re.search(r"(\d+)$", str((block or {}).get("anchor", "")))
+        return int(m.group(1)) if m else None
+
+    for op in job.ops:
+        if op.get("op") == "duplicate_sheet" and row_of(ext.get("ar")):
+            probes.add((op.get("source"), row_of(ext.get("ar"))))
+    for key in ("sales", "raw"):
+        blk = ext.get(key)
+        if blk and blk.get("target") and row_of(blk):
+            probes.add((blk["target"], row_of(blk)))
+    return [{"sheet": s, "row": r} for s, r in sorted(probes) if s and r]
 
 
 def _probe_formulas(src: str, probes: list[dict]) -> dict:
@@ -160,9 +185,13 @@ def _run(job_id: str, job: Job):
                     f.write(chunk)
         j["downloadedMB"] = round(os.path.getsize(src) / 1048576, 1)
 
-        if job.probe:
+        probes = _auto_probes(job) if job.extract else (job.probe or [])
+        if probes:
             j["stage"] = "probe"
-            j["formulaProbe"] = _probe_formulas(src, job.probe)
+            try:
+                j["formulaProbe"] = _probe_formulas(src, probes)
+            except Exception as pe:  # noqa: BLE001 — the probe must never kill a job
+                j["formulaProbe"] = {"error": str(pe)[:400]}
 
         if job.extract:
             j["stage"] = "extract"
@@ -183,7 +212,10 @@ def _run(job_id: str, job: Job):
                 raise ValueError(
                     f"extract returned {data['arCount']} AR / {data['salesCount']} sales "
                     "rows — refusing to write. Expected ~16,000 / ~13,500.")
-            job.ops = list(job.ops) + gen_ops     # APPEND: duplicate_sheet must run first
+            if job.extract.get("applyOps", True):
+                job.ops = list(job.ops) + gen_ops  # APPEND: duplicate_sheet must run first
+            else:
+                j["opsSkipped"] = "extract.applyOps=false — extract verified, no pastes generated"
 
         j["stage"] = "surgery"
         s = XlsxSurgeon(src, workdir=WORK)
@@ -230,14 +262,19 @@ def _run(job_id: str, job: Job):
         j.update(status="failed", error=str(e)[:800],
                  trace=traceback.format_exc()[-1200:])
     finally:
+        keep = {dst} if (job.keepResult and os.path.exists(dst)) else set()
+        if keep:
+            j["resultPath"] = dst
         for p in (src, dst):
+            if p in keep:
+                continue
             try:
                 os.remove(p)
             except OSError:
                 pass
 
 
-VERSION = "2026-08-17-extract-v1"
+VERSION = "2026-08-17-extract-v2"
 
 
 @app.get("/health")
@@ -260,3 +297,16 @@ def get_job(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(404, "unknown job")
     return JOBS[job_id]
+
+
+@app.get("/jobs/{job_id}/result")
+def get_job_result(job_id: str):
+    j = JOBS.get(job_id)
+    if not j:
+        raise HTTPException(404, "unknown job")
+    path = j.get("resultPath")
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "no kept result for this job (keepResult not "
+                                 "set, job not finished, or service restarted)")
+    from fastapi.responses import FileResponse
+    return FileResponse(path, filename=f"{job_id}_out.xlsx")
