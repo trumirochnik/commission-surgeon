@@ -58,21 +58,17 @@ def _pad(rows: list[list], width: int) -> list[list]:
     return out
 
 
-def _formula_cells(kind: str, first_row: int, count: int) -> dict[str, str]:
+def _formula_cells(kind: str, first_row: int, count: int,
+                   prior_ar_tab: str | None = None) -> dict[str, str]:
     """{'Z7': '=V7-L7', ...} for the rows we just wrote.
 
     Only templates present in FORMULA_TEMPLATES are emitted. Columns with no
     template are left alone — on existing rows the duplicated sheet's own
     formulas survive; on rows past the old extent they stay EMPTY. That is a
-    real gap, reported by build_ops() as `formulaGaps`, and it closes as soon as
-    the templates are read off row 7 of the prior month's sheet.
+    real gap, reported by build_ops() as `formulaGaps`.
     """
-    cells: dict[str, str] = {}
-    for col, tpl in (FORMULA_TEMPLATES.get(kind) or {}).items():
-        for i in range(count):
-            r = first_row + i
-            cells[f"{col}{r}"] = tpl.replace("{r}", str(r))
-    return cells
+    from netsuite_extract import formula_cells as _fc
+    return _fc(kind, first_row, count, prior_ar_tab=prior_ar_tab)
 
 
 def _span_cols(span: str) -> list[str]:
@@ -97,11 +93,15 @@ def _anchor_row(anchor: str) -> int:
     return int(m.group(1))
 
 
-def build_ops(data: dict, spec: dict) -> tuple[list[dict], dict]:
+def build_ops(data: dict, spec: dict, prior_ar_tab: str | None = None
+             ) -> tuple[list[dict], dict]:
     """extract results + the payload's `extract` spec -> ops for the surgeon.
 
     `spec` is the job's extract block: {ar:{target,anchor,formulaCols,writeMode},
-    sales:{...}, raw:{...}}. Returns (ops, report).
+    sales:{...}, raw:{...}}. `prior_ar_tab` is the sheet AR_07.31 (say) was
+    duplicated FROM (e.g. 'AR_06.30') — two AR formula columns (AD, AG) do a
+    prior-month XLOOKUP and need the real tab name, not last month's hardcoded
+    one carried forward. Returns (ops, report).
     """
     ops: list[dict] = []
     report: dict[str, Any] = {"formulaGaps": {}, "rowCounts": {}}
@@ -115,7 +115,7 @@ def build_ops(data: dict, spec: dict) -> tuple[list[dict], dict]:
     ops.append({"op": "paste_columns", "sheet": ar["target"],
                 "anchor": ar["anchor"], "rows": _pad(ar_rows, AR_DATA_COLS),
                 "clear_beyond": True})
-    cells = _formula_cells("ar", ar_first, len(ar_rows))
+    cells = _formula_cells("ar", ar_first, len(ar_rows), prior_ar_tab=prior_ar_tab)
     if cells:
         ops.append({"op": "set_cells", "sheet": ar["target"], "cells": cells})
     have = set(re.match(r"^([A-Z]+)", k).group(1) for k in cells)
@@ -144,12 +144,17 @@ def build_ops(data: dict, spec: dict) -> tuple[list[dict], dict]:
         tpl = FORMULA_TEMPLATES.get("raw") or {}
         if tpl:
             # appended rows are brand new, so widening the block is safe here
-            width = max(col_to_index(c) for c in tpl) 
+            width = max(col_to_index(c) for c in tpl)
         padded = _pad(sales_rows, width)
         if tpl:
-            for i, row in enumerate(padded):
+            # {r} is deliberately NOT substituted here: append_rows doesn't
+            # know a row's final sheet position until the surgeon actually
+            # writes it (it's appended past whatever the sheet's current
+            # last row is). row_xml() fills in the real row number at that
+            # point — see surgeon.py.
+            for row in padded:
                 for col, t in tpl.items():
-                    row[col_to_index(col) - 1] = t.replace("{r}", "")  # row unknown
+                    row[col_to_index(col) - 1] = t
         ops.append({"op": "append_rows", "sheet": raw["target"], "rows": padded})
         report["formulaGaps"]["raw"] = [c for c in _span_cols(raw.get("formulaCols", ""))
                                        if c not in tpl]

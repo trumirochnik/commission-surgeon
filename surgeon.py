@@ -73,8 +73,15 @@ def cell_xml(ref: str, value, style: int = 0) -> str:
 
 
 def row_xml(row_num: int, values, styles=None) -> str:
+    """Builds one <row>. append_rows/add_sheet are the only ops where the
+    caller cannot know a row's final number in advance (paste_columns and
+    set_cells target explicit refs, so callers substitute {r} themselves) —
+    a formula value still containing the literal '{r}' gets it filled in
+    here, at the one point row_num is actually known."""
     cells = []
     for i, v in enumerate(values):
+        if isinstance(v, str) and "{r}" in v:
+            v = v.replace("{r}", str(row_num))
         st = styles[i] if styles and i < len(styles) else 0
         x = cell_xml(f"{col_letter(i + 1)}{row_num}", v, st)
         if x:

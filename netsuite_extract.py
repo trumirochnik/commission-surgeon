@@ -544,26 +544,82 @@ def build_sales_rows(raw: list[dict], cust: dict[str, dict],
 # The surgeon writes any string starting with '=' as a real formula, so there is
 # no need for a fill_formulas op — the extract emits the formula TEXT per row.
 #
-# These templates MUST be read off the prior month's sheet, not invented. Only
-# the AR 'Z' column is confirmed (=V{r}-L{r}, seen at Z918 in 06.2026). Fill the
-# rest by clicking row 7 of AR_06.30 / New Sales report / Sales report Raw.
+# READ FROM THE REAL WORKBOOK 2026-08-17 via the surgeon's live formula probe
+# (a job run against the actual 06.2026 source file on Render — the file is
+# too large for any direct-read channel available here). Row 7 of AR_06.30 /
+# New Sales report row 7 / Sales report Raw row 4.
 #
-# A row's formula cells are produced by substituting {r} with the sheet row.
+# TWO cells (AR 'AD' and 'AG') hardcode the literal prior-tab name 'AR_05.31'
+# (June's OWN prior month). Templating that literally would make every future
+# month silently reference the wrong prior AR tab — August's run would still
+# say 'AR_05.31' instead of 'AR_07.31'. Those two use a SECOND placeholder,
+# {prior_ar_tab}, resolved per-run from the job's duplicate_sheet op (see
+# commission_job.build_ops). Every other cell only substitutes {r}.
+#
+# NOT independently verified: the SEARCH()-matched retailer names (Cavenders,
+# Scheels, Atwoods, The Glik Company, Quiet Storm, Bomgaar) and the numeric
+# thresholds (H7>1121738, H7>1122227) are transcribed exactly as found — they
+# are business rules (rate-change cutovers), not something this code can
+# confirm is still current. Same for the 'Kevin Hanks' and 'Commission Rate
+# by SKUs' sheet references (fixed lookup tabs, not month-dependent, so safe
+# to carry literally). CONFIRM the first automated run's commission numbers
+# by hand before trusting this unattended.
 
 FORMULA_TEMPLATES = {
     "ar": {                       # AR tab, columns Y:AH
+        "Y": ('=IF(AND(ISNUMBER(SEARCH("Cavenders",X{r})),H{r}>1121738,YEAR(F{r})<2026),0.09,'
+              'IF(ISNUMBER(SEARCH("Cavenders",X{r})),0.0275,'
+              'IF(AND(ISNUMBER(SEARCH("Scheels",X{r})),H{r}>1122227,YEAR(F{r})<2026),0.07,'
+              'IF(OR(ISNUMBER(SEARCH("Atwoods",X{r})),ISNUMBER(SEARCH("Scheels",X{r})),'
+              'ISNUMBER(SEARCH("The Glik Company",X{r})),ISNUMBER(SEARCH("Quiet Storm",X{r})),'
+              'ISNUMBER(SEARCH("Glik",X{r}))),0.05,'
+              'IF(AND(ISNUMBER(SEARCH("Bomgaar",X{r})),U{r}="Kelly Kennedy",AF{r}="Core",F{r}>$AI$1),0.06,'
+              'IF(AND(ISNUMBER(SEARCH("Bomgaar",X{r})),U{r}="Kelly Kennedy",AF{r}="Licensed",F{r}>$AI$1),0.045,'
+              '" "))))))'),
         "Z": "=V{r}-L{r}",        # CONFIRMED: Difference (Open Balance)
-        # "Y":  "=...",           # Contracted
-        # "AA": "=...",           # Commission Rate
-        # "AB": "=...",           # <Month> Unearned Commission
-        # "AC": "=...",           # Concatenation No. & Item
-        # "AD": "=...",           # Last month open balance
-        # "AE": "=...",           # Partial Payment
-        # "AF": "=...",           # Product Type
-        # "AG"/"AH": Delete later — probably safe to leave empty
+        "AA": ('=IFERROR(IF(OR(U{r}="8 Nolita",U{r}="None"),"0",'
+               'IF(U{r}="Kevin Hanks",Y{r},'
+               'IF(ISNUMBER(SEARCH("Bomgaars",X{r})),Y{r},'
+               'IF(AND(U{r}=$AE$1,F{r}>$AD$1)," ",'
+               'VLOOKUP(I{r},\'Commission Rate by SKUs\'!B:E,4,0))))),0.1)'),
+        "AB": "=IFERROR(L{r}*AA{r},0)",
+        "AC": '=+CONCATENATE(H{r}," - ",I{r})',
+        "AD": ('=+IFERROR(IF(F{r}<$AD$4,_xlfn.XLOOKUP(AC{r},\'{prior_ar_tab}\'!AG:AG,'
+               "'{prior_ar_tab}'!L:L),IF(F{r}>$AD$4,V{r},\" \")),0)"),
+        "AE": ('=IF(AND(U{r}="Kevin Hanks",Y{r}=" ")," ",'
+               'IF(U{r}=""," ",IF(AD{r}<>" ",L{r}-AD{r}," ")))'),
+        "AF": '=IF(ISNUMBER(MATCH(I{r},\'Commission Rate by SKUs\'!$B:$B,0)),"Licensed","Core")',
+        "AG": "=_xlfn.XLOOKUP(AC{r},'{prior_ar_tab}'!AG:AG,'{prior_ar_tab}'!L:L)",
+        "AH": "=L{r}-AG{r}",
     },
-    "sales": {},                  # New Sales report, columns Z:AH
-    "raw": {},                    # Sales report Raw, columns Z:AA
+    "sales": {                     # New Sales report, columns Z:AH
+        "Z": "=_xlfn.XLOOKUP(H{r},'Kevin Hanks'!R:R,'Kevin Hanks'!S:S,\" \")",
+        "AA": ('=IF(AND(ISNUMBER(SEARCH("Cavenders",Y{r})),H{r}>1121738,YEAR(F{r})<2026),0.09,'
+               'IF(ISNUMBER(SEARCH("Cavenders",Y{r})),0.0275,'
+               'IF(AND(ISNUMBER(SEARCH("Scheels",Y{r})),H{r}>1122227,YEAR(F{r})<2026),0.07,'
+               'IF(OR(ISNUMBER(SEARCH("Atwoods",Y{r})),ISNUMBER(SEARCH("Scheels",Y{r})),'
+               'ISNUMBER(SEARCH("The Glik Company",Y{r})),ISNUMBER(SEARCH("Quiet Storm",Y{r})),'
+               'ISNUMBER(SEARCH("Glik",Y{r}))),0.05,'
+               'IF(AND(ISNUMBER(SEARCH("Bomgaar",Y{r})),U{r}="Kelly Kennedy",AH{r}="Core",F{r}>$AI$1),0.06,'
+               'IF(AND(ISNUMBER(SEARCH("Bomgaar",Y{r})),U{r}="Kelly Kennedy",AH{r}="Licensed",F{r}>$AI$1),0.045,'
+               '" "))))))'),
+        "AB": ('=_xlfn.IFS(AND(U{r}=$AI$4,T{r}>$AJ$4),"",G{r}="Cash Sale",F{r},'
+               'ISBLANK(T{r}),"",T{r}<=$AC$6,T{r},T{r}>$AC$6,"")'),
+        "AC": '=IFERROR(MONTH(AB{r}),"")',
+        "AD": ('=IFERROR(IF(OR(U{r}="8 Nolita",U{r}="None"),"0",'
+               'IF(U{r}="Kevin Hanks",AA{r},'
+               'IF(ISNUMBER(SEARCH("Bomgaars",Y{r})),AA{r},'
+               'IF(AND(U{r}=$AI$4,F{r}>$AH$4)," ",'
+               'VLOOKUP(I{r},\'Commission Rate by SKUs\'!B:E,4,0))))),0.1)'),
+        "AE": "=IFERROR(V{r}*AD{r},0)",
+        "AF": ('=IFERROR(IF(OR(AC{r}*1<Dashboard!$C$34,AC{r}*1=Dashboard!$C$34),AE{r},""),"")'),
+        "AG": '=_xlfn.CONCAT(H{r}," - ",I{r})',
+        "AH": '=IF(ISNUMBER(MATCH(I{r},\'Commission Rate by SKUs\'!$B:$B,0)),"Licensed","Core")',
+    },
+    "raw": {                       # Sales report Raw, columns Z:AA
+        "Z": '=TEXT(T{r},"MMM YY")',
+        "AA": '=+CONCATENATE(H{r}," - ",I{r})',
+    },
 }
 
 
@@ -574,13 +630,25 @@ def col_to_index(col: str) -> int:
     return n
 
 
-def formula_cells(kind: str, first_row: int, count: int) -> dict[str, str]:
-    """{'Z7': '=V7-L7', 'Z8': ...} for a set_cells op, or fold into paste rows."""
+def formula_cells(kind: str, first_row: int, count: int,
+                  prior_ar_tab: str | None = None) -> dict[str, str]:
+    """{'Z7': '=V7-L7', 'Z8': ...} for a set_cells op, or fold into paste rows.
+
+    prior_ar_tab fills the AR 'AD'/'AG' XLOOKUP templates' {prior_ar_tab}
+    placeholder. Required whenever kind == 'ar' and those templates are
+    populated — raises rather than silently emit a formula pointing at last
+    month's prior tab."""
     out: dict[str, str] = {}
     for tpl_col, tpl in FORMULA_TEMPLATES.get(kind, {}).items():
+        if "{prior_ar_tab}" in tpl and not prior_ar_tab:
+            raise ValueError(
+                f"{kind!r} template {tpl_col!r} needs prior_ar_tab but none was given")
         for i in range(count):
             r = first_row + i
-            out[f"{tpl_col}{r}"] = tpl.replace("{r}", str(r))
+            cell = tpl.replace("{r}", str(r))
+            if prior_ar_tab:
+                cell = cell.replace("{prior_ar_tab}", prior_ar_tab)
+            out[f"{tpl_col}{r}"] = cell
     return out
 
 
