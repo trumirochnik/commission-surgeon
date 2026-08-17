@@ -63,6 +63,34 @@ ID_BATCH = 250               # transactions per line-detail call
 CUST_BATCH = 400             # customer ids per dimension call
 EXCEL_EPOCH = dt.date(1899, 12, 30)
 
+# Column P ("Partner: Partner Category") comes from the partner record's category.
+# VERIFIED 2026-08-17 once Lists > Partners (View) was granted: 74 partners, and the
+# value is NOT uniform — "Primary Rep" mostly, but also "Rep Manager" (Gary Pollack),
+# "Royalty" (BATA), "Adjustment Partner", and blanks. Hardcoding it would be wrong.
+PARTNER_ROLE_FALLBACK = None
+
+# Column M renders as "EMP101 Mark Saviski" — code AND name. BUILTIN.DF(t.employee)
+# gives only the code, and the `employee` table is permission-blocked for this
+# credential (HTTP 400 "Record not found" = missing Lists > Employee Record View).
+# There are only 13 distinct codes in a month, so this is a lookup table.
+# Unmapped codes fall through as the bare code and are listed in diagnostics —
+# read the missing names off column M of the workbook and add them here.
+EMPLOYEE_NAMES = {
+    "EMP101": "Mark Saviski",
+    "EMP140": "Not Applicable",
+    "EMP204": "Kevin Hanks",
+    # "EMP109": "", "EMP124": "", "EMP161": "", "EMP165": "", "EMP179": "",
+    # "EMP208": "", "EMP245": "", "EMP254": "", "EMP262": "", "EMP374": "",
+}
+
+
+def employee_label(code: Any) -> Any:
+    """'EMP101' -> 'EMP101 Mark Saviski'; unknown codes pass through unchanged."""
+    if not code:
+        return code
+    name = EMPLOYEE_NAMES.get(str(code).strip())
+    return f"{code} {name}" if name else code
+
 EXCLUDED_PARTNERS = {
     "Pfeiffer of America", "RMCC", "RMCC/Canada", "RMCC/Cavenders",
     "RMCC/Gander Mountain", "RMCC/Midstates", "RMCC/Wheatbelt", "Temp",
@@ -286,9 +314,11 @@ ORDER BY t.id, tl.id
 def q_customers(ids: list[str]) -> str:
     """Rule 3: by id only.
 
-    c07 is the customer's shipping state. Column N of the workbook is
-    customer-level (values are constant per client), which is why it belongs
-    here and NOT as a transactionShippingAddress join — see rule 2.
+    VERIFIED 2026-08-17: `custentity_shipping_state` and `partnercategory` DO NOT
+    EXIST on customer (HTTP 500). Shipping state comes from fetch_states() instead.
+    The partner ROLE (col P, "Primary Rep") is not reachable — the `partner` and
+    `entity` tables are permission-blocked for this role — so PARTNER_ROLE is a
+    constant. See those notes below.
     """
     return f"""
 SELECT cu.id AS c01,
@@ -297,9 +327,7 @@ SELECT cu.id AS c01,
   cu.firstsaledate AS c04,
   BUILTIN.DF(cu.custentitystore_type) AS c05,
   cu.companyname AS c06,
-  cu.custentity_shipping_state AS c07,      -- VERIFY: field name unconfirmed
-  BUILTIN.DF(cu.partner) AS c08,
-  cu.partnercategory AS c09                 -- VERIFY: 'Primary Rep' role, col P
+  BUILTIN.DF(cu.partner) AS c07
 FROM customer cu
 WHERE cu.id IN ({','.join(ids)})
 ORDER BY cu.id
@@ -308,58 +336,85 @@ ORDER BY cu.id
 
 def q_items(ids: list[str]) -> str:
     """Real product descriptions for column J.
-    `item.salesdescription` returns HTTP 500 on this account; `description` is
-    the fallback. If both fail, fall back to itemid and flag it."""
+    VERIFIED 2026-08-17: `i.description` works (`i.salesdescription` is HTTP 500).
+    e.g. itemid 96993 -> "TJX - Women's Elements Overspray - 100 mL EDP - Ruby".
+
+    Keyed on i.itemid, NOT i.id: the line queries return c05 = i.itemid (the SKU
+    code). SKUs are not all numeric — there are codes like DISC00 and OLD* — so they
+    MUST be quoted, or SuiteQL parses them as identifiers and rejects the query."""
     return f"""
-SELECT i.id AS c01, i.itemid AS c02, i.description AS c03
+SELECT i.itemid AS c01, i.description AS c02
 FROM item i
-WHERE i.id IN ({','.join(ids)})
-""".strip()
-
-
-def q_employees(ids: list[str]) -> str:
-    """Column M renders as 'EMP101 Mark Saviski' — code AND name.
-    BUILTIN.DF(t.employee) yields only 'EMP101', so join the name here."""
-    return f"""
-SELECT e.id AS c01, e.entityid AS c02, e.firstname AS c03, e.lastname AS c04
-FROM employee e
-WHERE e.id IN ({','.join(ids)})
+WHERE i.itemid IN ({sql_list(ids)})
 """.strip()
 
 
 # ─────────────────────────── dimensions ───────────────────────────
 
 def fetch_customers(mcp: Mcp, ids: list[str]) -> dict[str, dict]:
+    """Rule 3: by id, for only the ids seen on the lines."""
     out: dict[str, dict] = {}
     for batch in chunks(ids, CUST_BATCH):
         for r in mcp.rows(q_customers(batch), "customer dim"):
             out[str(g(r, 1))] = {
                 "type": g(r, 2), "category": g(r, 3),
                 "first_sale": serial(g(r, 4)), "store_type": g(r, 5),
-                "company": g(r, 6), "state": g(r, 7),
-                "partner": g(r, 8), "partner_role": g(r, 9),
+                "company": g(r, 6), "partner": g(r, 7),
             }
     return out
 
 
-def fetch_employees(mcp: Mcp, ids: list[str]) -> dict[str, str]:
+def q_partners() -> str:
+    """Partner name -> category, for column P. 74 rows, one page.
+    Keyed on entityid because the line query returns BUILTIN.DF(t.partner) (a name),
+    not the internal id. Requires Lists > Partners (View)."""
+    return "SELECT p.entityid AS c01, BUILTIN.DF(p.category) AS c02 FROM partner p"
+
+
+def fetch_partners(mcp: Mcp) -> dict[str, str]:
     out: dict[str, str] = {}
-    for batch in chunks(ids, CUST_BATCH):
-        for r in mcp.rows(q_employees(batch), "employee dim"):
-            code = g(r, 2) or ""
-            name = " ".join(x for x in (g(r, 3), g(r, 4)) if x)
-            out[str(g(r, 1))] = f"{code} {name}".strip()
+    for r in mcp.rows(q_partners(), "partner dim"):
+        name, cat = g(r, 1), g(r, 2)
+        if name and cat:
+            out[str(name).strip()] = cat
     return out
 
 
-# ─────────────────────────── assembly ───────────────────────────
+def q_states(ids: list[str]) -> str:
+    """Shipping state (col N) keyed by TRANSACTION id.
 
-def _dim_lookup(cust: dict, key: str) -> Any:
+    VERIFIED 2026-08-17: transactionShippingAddress.state works fine on a small
+    keyed id set (returns IL/TN/NM). It is only fatal when joined into the full
+    line query — see rule 2. The customer's own address tables
+    (CustomerAddressbook*) return empty for this role, and `defaultshippingaddress`
+    is just an id with nothing readable behind it, so this is the only route.
+    """
+    return f"""
+SELECT t.id AS c01, tsa.state AS c02
+FROM transaction t
+LEFT JOIN transactionShippingAddress tsa ON tsa.nkey = t.shippingaddress
+WHERE t.id IN ({','.join(ids)})
+""".strip()
+
+
+def fetch_states(mcp: Mcp, ids: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for batch in chunks(ids, CUST_BATCH):
+        for r in mcp.rows(q_states(batch), "shipping state"):
+            st = g(r, 2)
+            if st:
+                out[str(g(r, 1))] = st
+    return out
+
+
+def _dim_lookup(cust: dict | None, key: str) -> Any:
+    """Safe read from the customer dimension — the row may have no match."""
     return cust.get(key) if cust else None
 
 
-def build_ar_rows(raw: list[dict], cust: dict[str, dict], emp: dict[str, str],
-                  items: dict[str, str], sign_flip: bool) -> list[list]:
+def build_ar_rows(raw: list[dict], cust: dict[str, dict],
+                  items: dict[str, str], states: dict[str, str],
+                  partners: dict[str, str], sign_flip: bool) -> list[list]:
     """24 values per row -> AR tab columns A:X.
 
     A Client:Project   B Customer_Type   C Client Category  D First Sale Date
@@ -407,10 +462,10 @@ def build_ar_rows(raw: list[dict], cust: dict[str, dict], emp: dict[str, str],
             items.get(str(item_id), item_id),
             qty * sf if isinstance(qty, float) else qty,
             bal * sf if isinstance(bal, float) else bal,
-            emp.get(str(g(r, 8)), g(r, 8)),
-            _dim_lookup(c, "state"),
+            employee_label(g(r, 8)),
+            states.get(str(g(r, 14))),
             partner,
-            _dim_lookup(c, "partner_role"),
+            partners.get(str(partner).strip(), PARTNER_ROLE_FALLBACK) if partner else None,
             None,                                   # rule 6: commission % empty
             g(r, 10),
             serial(g(r, 11)),
@@ -426,8 +481,9 @@ def build_ar_rows(raw: list[dict], cust: dict[str, dict], emp: dict[str, str],
                  "unmatched_customers": unmatched}
 
 
-def build_sales_rows(raw: list[dict], cust: dict[str, dict], emp: dict[str, str],
-                     items: dict[str, str], sign_flip: bool) -> list[list]:
+def build_sales_rows(raw: list[dict], cust: dict[str, dict],
+                     items: dict[str, str], states: dict[str, str],
+                     partners: dict[str, str], sign_flip: bool) -> list[list]:
     """25 values per row -> New Sales report / Sales report Raw columns A:Y.
     Same A:X shape as AR, plus Y = rate."""
     sf = -1 if sign_flip else 1
@@ -463,10 +519,10 @@ def build_sales_rows(raw: list[dict], cust: dict[str, dict], emp: dict[str, str]
             items.get(str(item_id), item_id),
             qty * sf if isinstance(qty, float) else qty,
             amt * sf if isinstance(amt, float) else amt,
-            emp.get(str(g(r, 8)), g(r, 8)),
-            _dim_lookup(c, "state"),
+            employee_label(g(r, 8)),
+            states.get(str(g(r, 14))),
             partner,
-            _dim_lookup(c, "partner_role"),
+            partners.get(str(partner).strip(), PARTNER_ROLE_FALLBACK) if partner else None,
             None,
             g(r, 10),
             serial(g(r, 11)),
@@ -546,20 +602,29 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
         log(f"[sales] batch {n}: {len(sales_raw)} lines so far")
 
     ent_ids = sorted({str(g(r, 15)) for r in ar_raw + sales_raw if g(r, 15)})
-    emp_ids = sorted({str(g(r, 8)) for r in ar_raw + sales_raw if g(r, 8)})
+    emp_codes = sorted({str(g(r, 8)) for r in ar_raw + sales_raw if g(r, 8)})
     item_ids = sorted({str(g(r, 5)) for r in ar_raw + sales_raw if g(r, 5)})
-    log(f"[dim] {len(ent_ids)} customers, {len(emp_ids)} employees, "
-        f"{len(item_ids)} items")
+    unmapped = [c for c in emp_codes if c not in EMPLOYEE_NAMES]
+    log(f"[dim] {len(ent_ids)} customers, {len(emp_codes)} employee codes "
+        f"({len(unmapped)} unmapped), {len(item_ids)} items")
+    if unmapped:
+        log(f"[dim] add these to EMPLOYEE_NAMES: {', '.join(unmapped)}")
 
+    txn_ids = sorted({str(g(r, 14)) for r in ar_raw + sales_raw if g(r, 14)})
+    states = fetch_states(mcp, txn_ids)
+    partners = fetch_partners(mcp)
+    log(f"[dim] {len(partners)} partner categories")
+    log(f"[dim] {len(states)} shipping states")
     cust = fetch_customers(mcp, ent_ids)
-    emp = fetch_employees(mcp, emp_ids)
     items: dict[str, str] = {}
     for batch in chunks(item_ids, CUST_BATCH):
         for r in mcp.rows(q_items(batch), "item dim"):
-            items[str(g(r, 1))] = g(r, 3) or g(r, 2)
+            desc = g(r, 2)
+            if desc:
+                items[str(g(r, 1))] = re.sub(r"\s+", " ", str(desc)).strip()
 
-    ar_rows, ar_diag = build_ar_rows(ar_raw, cust, emp, items, sign_flip)
-    sales_rows, sales_diag = build_sales_rows(sales_raw, cust, emp, items, sign_flip)
+    ar_rows, ar_diag = build_ar_rows(ar_raw, cust, items, states, partners, sign_flip)
+    sales_rows, sales_diag = build_sales_rows(sales_raw, cust, items, states, partners, sign_flip)
 
     ar_total = sum(r[11] for r in ar_rows if isinstance(r[11], float))
     sales_total = sum(r[11] for r in sales_rows if isinstance(r[11], float))
@@ -571,8 +636,10 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
         "salesAmount": round(sales_total, 2),
         "txnCount": len(ids),
         "diagnostics": {"ar": ar_diag, "sales": sales_diag,
-                        "customers": len(cust), "employees": len(emp),
-                        "items": len(items), "signFlip": sign_flip},
+                        "customers": len(cust), "employeeCodes": len(emp_codes),
+                        "employeesUnmapped": unmapped,
+                        "items": len(items), "states": len(states),
+                        "partners": len(partners), "signFlip": sign_flip},
     }
 
 

@@ -125,7 +125,9 @@ class XlsxSurgeon:
 
     # -- public ops --------------------------------------------------------
     def set_cells(self, sheet: str, cells: dict, style_from: dict | None = None):
-        if sheet not in self._sheet_parts:
+        # may target a sheet created by duplicate_sheet earlier in the same job
+        pending_dup = any(o[0] == "dup" and o[1] == sheet for o in self._ops)
+        if sheet not in self._sheet_parts and not pending_dup:
             raise KeyError(f"sheet {sheet!r} not found; have {self.sheet_names()}")
         self._ops.append(("set", sheet, (cells, style_from or {})))
 
@@ -188,23 +190,43 @@ class XlsxSurgeon:
         # register new sheets in workbook.xml / rels / content types
         wb_xml, wb_rels, ctypes = self._wb_xml, self._wb_rels, self._ctypes
         new_parts = []
-        # duplicated sheets: read source part, strip drawing/table refs, queue as new part
+        results: list[dict] = []      # per-target change counts, returned to caller
+        # duplicated sheets: read source part, strip relationship refs, queue as new part
         if dup_sheets:
             with zipfile.ZipFile(self.src) as zf:
                 for new_name, source in dup_sheets:
-                    xml = zf.read(self._sheet_parts[source]).decode("utf-8")
+                    src_part = self._sheet_parts[source]
+                    src_size = zf.getinfo(src_part).file_size
+                    xml = zf.read(src_part).decode("utf-8")
                     xml = re.sub(r"<drawing\b[^>]*/>", "", xml)
                     xml = re.sub(r"<legacyDrawing\b[^>]*/>", "", xml)
                     xml = re.sub(r"<tableParts\b.*?</tableParts>", "", xml, flags=re.S)
                     xml = re.sub(r"<tableParts\b[^>]*/>", "", xml)
+                    # The copy gets NO _rels part, so ANY surviving r:id is a hard
+                    # OPC violation — Excel repairs the file and drops the sheet.
+                    # pageSetup carries an r:id whenever the sheet ever had a
+                    # print area; hyperlinks/pictures/controls likewise.
+                    for tag in ("pageSetup", "hyperlink", "picture",
+                                "oleObject", "control"):
+                        xml = re.sub(rf"<{tag}\b[^>]*/>", "", xml)
+                        xml = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", "", xml, flags=re.S)
+                    for wrap in ("hyperlinks", "oleObjects", "controls"):
+                        xml = re.sub(rf"<{wrap}\s*/>", "", xml)
+                        xml = re.sub(rf"<{wrap}\s*>\s*</{wrap}>", "", xml)
+                    self._assert_no_dangling_rids(f"duplicate of {source!r}", xml, ())
                     # duplicated sheet may still need pastes applied to it later:
                     # apply queued paste/set ops that target the NEW name in-memory now
+                    changed = 1                     # the new sheet itself
                     pend = [o for o in self._ops if o[1] == new_name and o[0] in ("paste", "set")]
                     for kind2, _, payload2 in pend:
                         if kind2 == "paste":
-                            xml = self._apply_paste(xml, *payload2)
+                            xml, n = self._apply_paste(xml, *payload2)
                         else:
-                            xml = self._apply_set_cells(xml, payload2[0])
+                            xml, n = self._apply_set_cells(xml, payload2[0])
+                        changed += n
+                    results.append({"target": new_name, "kind": "duplicate_sheet",
+                                    "sourcePartMB": round(src_size / 1048576, 1),
+                                    "cellsChanged": changed})
                     new_sheets.append((new_name, ("__RAW__", xml)))
         if new_sheets:
             max_sheet_num = 0
@@ -237,6 +259,9 @@ class XlsxSurgeon:
                 if rows == "__RAW__":
                     new_parts.append((part, styles))     # styles holds raw xml here
                 else:
+                    results.append({"target": name, "kind": "add_sheet",
+                                    "cellsChanged": max(
+                                        1, sum(len(r) for r in rows))})
                     new_parts.append((part, self._build_sheet_xml(rows, styles)))
 
         # calcChain: drop part + its Content_Types override + workbook rel
@@ -255,12 +280,18 @@ class XlsxSurgeon:
         else:
             wb_xml = wb_xml.replace("</sheets>", '</sheets><calcPr fullCalcOnLoad="1"/>', 1)
 
+        # every r:id the workbook references must have a matching relationship
+        self._assert_no_dangling_rids(
+            "xl/workbook.xml", wb_xml,
+            re.findall(r'Id="([^"]+)"', wb_rels))
+
         replaced = {
             "xl/workbook.xml": wb_xml.encode("utf-8"),
             "xl/_rels/workbook.xml.rels": wb_rels.encode("utf-8"),
             "[Content_Types].xml": ctypes.encode("utf-8"),
         }
 
+        part_to_name = {v: k for k, v in self._sheet_parts.items()}
         with zipfile.ZipFile(self.src) as zin, \
              zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED) as zout:
             for info in zin.infolist():
@@ -274,10 +305,17 @@ class XlsxSurgeon:
                     with zin.open(name) as f, open(tmp_in, "wb") as out:
                         shutil.copyfileobj(f, out, CHUNK)
                     tmp_out = os.path.join(self.workdir, "part_out.xml")
-                    self._transform_sheet(tmp_in, tmp_out,
-                                          per_part[name]["set"],
-                                          per_part[name]["append"],
-                                          per_part[name].get("paste", []))
+                    changed = self._transform_sheet(
+                        tmp_in, tmp_out,
+                        per_part[name]["set"],
+                        per_part[name]["append"],
+                        per_part[name].get("paste", []))
+                    # transforms only rewrite <row>/<c> content, which never
+                    # carries r:id, and the part's own _rels streams through
+                    # untouched — so no dangling-rid scan is needed here.
+                    results.append({"target": part_to_name.get(name, name),
+                                    "kind": "transform",
+                                    "cellsChanged": changed})
                     zi = zipfile.ZipInfo(name)
                     zi.compress_type = zipfile.ZIP_DEFLATED
                     with open(tmp_out, "rb") as f:
@@ -292,8 +330,23 @@ class XlsxSurgeon:
                         with zout.open(zi, "w", force_zip64=True) as w:
                             shutil.copyfileobj(f, w, CHUNK)
             for part, xml in new_parts:
+                # authored in memory with no _rels part: r:ids must be gone
+                self._assert_no_dangling_rids(part, xml, ())
                 zout.writestr(part, xml)
-        return dst_path
+
+        if sum(r["cellsChanged"] for r in results) == 0:
+            raise ValueError(
+                "no op changed anything — refusing to upload an unmodified file")
+        return results
+
+    @staticmethod
+    def _assert_no_dangling_rids(part_name: str, xml: str, rel_ids) -> None:
+        used = set(re.findall(r'r:id="([^"]+)"', xml))
+        dangling = used - set(rel_ids)
+        if dangling:
+            raise ValueError(
+                f"{part_name}: relationship ids {sorted(dangling)} have no "
+                "matching _rels entry — writing this part would corrupt the file")
 
     # -- sheet XML construction / transformation ---------------------------
     @staticmethod
@@ -316,6 +369,7 @@ class XlsxSurgeon:
         decompressed) — Dashboard-class sheets. Appends work on any size.
         """
         size = os.path.getsize(src)
+        changed = 0
 
         if set_cells or paste_groups:
             if size > 32 * 1024 * 1024:
@@ -324,14 +378,17 @@ class XlsxSurgeon:
             with open(src, "r", encoding="utf-8") as f:
                 xml = f.read()
             for anchor, rows, clear in (paste_groups or []):
-                xml = self._apply_paste(xml, anchor, rows, clear)
+                xml, n = self._apply_paste(xml, anchor, rows, clear)
+                changed += n
             if set_cells:
-                xml = self._apply_set_cells(xml, set_cells)
+                xml, n = self._apply_set_cells(xml, set_cells)
+                changed += n
             if append_groups:
-                xml = self._apply_append_inmem(xml, append_groups)
+                xml, n = self._apply_append_inmem(xml, append_groups)
+                changed += n
             with open(dst, "w", encoding="utf-8") as f:
                 f.write(xml)
-            return
+            return changed
 
         # append-only path: bounded memory regardless of sheet size
         tail_len = min(size, 2 * 1024 * 1024)
@@ -360,6 +417,7 @@ class XlsxSurgeon:
                 new_rows_xml.append(row_xml(r, values, styles))
                 ncols_new = max(ncols_new, len(values))
                 appended += 1
+                changed += len(values)
         insertion = "".join(new_rows_xml)
         tail = tail[:close_idx] + insertion + tail[close_idx:]
 
@@ -398,8 +456,14 @@ class XlsxSurgeon:
                 # whole file fit in the tail window
                 pass
             fout.write(tail.encode("utf-8"))
+        return changed
 
-    def _apply_set_cells(self, xml: str, cells: dict) -> str:
+    def _apply_set_cells(self, xml: str, cells: dict) -> tuple[str, int]:
+        # a sheet with no rows serializes as <sheetData/> — the </sheetData>
+        # insertion fallback below matches nothing on it and the cells would
+        # silently vanish (the paste path already normalises this; so must we)
+        xml = re.sub(r"<sheetData\s*/>", "<sheetData></sheetData>", xml, count=1)
+
         by_row: dict[int, dict[str, object]] = {}
         for ref, val in cells.items():
             col, row = split_ref(ref)
@@ -424,7 +488,15 @@ class XlsxSurgeon:
                         break
                 if not inserted:
                     xml = xml.replace("</sheetData>", new + "</sheetData>", 1)
-        return xml
+
+        # every ref we wrote a value into must actually be in the result
+        # (None/"" deletes the cell, so those refs are exempt)
+        missing = [ref for ref, val in cells.items()
+                   if val not in (None, "") and f'r="{ref}"' not in xml]
+        if missing:
+            raise ValueError(f"set_cells failed to write {missing} — the "
+                             "cells are not present in the transformed sheet")
+        return xml, len(cells)
 
     @staticmethod
     def _rebuild_row(row_frag: str, row_num: int, colvals: dict) -> str:
@@ -451,7 +523,8 @@ class XlsxSurgeon:
         body = "".join(cells[k] for k in sorted(cells))
         return header + body + "</row>"
 
-    def _apply_paste(self, xml: str, anchor: str, rows: list, clear_beyond: bool) -> str:
+    def _apply_paste(self, xml: str, anchor: str, rows: list,
+                     clear_beyond: bool) -> tuple[str, int]:
         a_col, a_row = split_ref(anchor)
         start_col = col_index(a_col)
         width = max((len(r) for r in rows), default=0)
@@ -483,24 +556,28 @@ class XlsxSurgeon:
             base = existing.get(rn, f'<row r="{rn}"></row>')
             out_rows[rn] = self._rebuild_row(base, rn, colvals)
         # rows below the pasted block: keep, optionally clearing block columns
+        cleared = 0
         for rn, frag in existing.items():
             if rn >= a_row + len(rows):
                 if clear_beyond and width:
                     colvals = {col_letter(c): None for c in block_cols}
                     out_rows[rn] = self._rebuild_row(frag, rn, colvals)
+                    cleared += 1
                 else:
                     out_rows[rn] = frag
         new_body = "".join(out_rows[k] for k in sorted(out_rows))
-        return head + new_body + tail
+        return head + new_body + tail, len(rows) * width + cleared * width
 
-    def _apply_append_inmem(self, xml: str, append_groups) -> str:
+    def _apply_append_inmem(self, xml: str, append_groups) -> tuple[str, int]:
         last_row = 0
         for m in re.finditer(r'<row r="(\d+)"', xml):
             last_row = max(last_row, int(m.group(1)))
         r = last_row
-        rows_xml = []
+        rows_xml, changed = [], 0
         for rows, styles in append_groups:
             for values in rows:
                 r += 1
                 rows_xml.append(row_xml(r, values, styles))
-        return xml.replace("</sheetData>", "".join(rows_xml) + "</sheetData>", 1)
+                changed += len(values)
+        return (xml.replace("</sheetData>", "".join(rows_xml) + "</sheetData>", 1),
+                changed)
