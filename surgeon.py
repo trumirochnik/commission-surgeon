@@ -500,19 +500,30 @@ class XlsxSurgeon:
 
     def _apply_row_ops(self, xml: str, paste_groups: list,
                        cell_groups: list) -> tuple[str, int]:
-        """Single extract -> single rebuild-per-row -> single join, for
-        however many paste_columns/set_cells ops target ONE sheet part.
+        """Single streaming pass — never materializes a dict of every row's
+        content — for however many paste_columns/set_cells ops target ONE
+        sheet part.
 
-        Doing paste and set_cells as two independent full-document passes
-        (extract all rows, rebuild, join — twice) roughly doubles peak memory
-        and wall time on any sheet touched by both, which on a real month's
-        file is exactly AR_07.31 (paste A:X + set_cells Y:AH, ~16k rows) and
-        'New Sales report' (paste A:Y + set_cells Z:AH, ~13.5k rows) — the
-        two sheets that OOM'd a 512MB Render instance. Merging every op's
-        column writes into ONE colvals-per-row dict before calling
-        _rebuild_row means each touched row is rebuilt exactly once, and the
-        whole document is only ever held as two full copies (existing +
-        result) rather than four.
+        An earlier version built `{row_num: full_row_fragment}` via a dict
+        comprehension over the WHOLE document before touching anything. That
+        forces Python's lazy `finditer` iterator to fully materialize —
+        every row's content copied a second time into new string objects,
+        on top of the source string already held in memory. On a real
+        month's file that's exactly AR_07.31 (paste A:X + set_cells Y:AH,
+        ~16k rows) and 'New Sales report' (paste A:Y + set_cells Z:AH,
+        ~13.5k rows) — the two sheets that OOM'd a 512MB Render instance.
+
+        This version iterates `finditer` lazily, one row at a time (same
+        technique the disk-streamed append path already uses successfully
+        on a sheet with 464,908+ rows), deciding immediately whether to
+        rebuild or pass a row through, and discarding the match before
+        moving to the next. Peak memory is roughly source + result (~2x
+        the sheet size), not existing-dict + result-dict + source + join
+        (~3-4x). New rows past the source's extent, and clear_beyond on
+        rows below the pasted block, are handled inline via a sorted
+        pointer into the touched-row list — relies on OOXML rows always
+        being stored in ascending r= order (the append path already
+        assumes this same invariant).
         """
         xml = re.sub(r"<sheetData\s*/>", "<sheetData></sheetData>", xml, count=1)
         open_m = re.search(r"<sheetData>", xml)
@@ -520,9 +531,6 @@ class XlsxSurgeon:
         if not open_m or close_i == -1:
             raise ValueError("sheetData not found")
         head, body, tail = xml[:open_m.end()], xml[open_m.end():close_i], xml[close_i:]
-
-        row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*)?(?:/>|>.*?</row>)', re.S)
-        existing = {int(m.group(1)): m.group(0) for m in row_re.finditer(body)}
 
         row_colvals: dict[int, dict[str, object]] = {}
         clear_specs = []      # (block_cols, last_new_row) per paste op
@@ -549,31 +557,42 @@ class XlsxSurgeon:
 
         changed = sum(len(cv) for cv in row_colvals.values())
 
-        # build out_rows by rebuilding ONLY touched rows, then passing
-        # untouched rows through by reference — NOT dict(existing) followed
-        # by overwrites. In the real case (paste+set_cells together cover
-        # every data row) that upfront copy would clone every row fragment
-        # a moment before discarding nearly all of them: measured ~23% MORE
-        # peak memory than doing paste and set_cells as two separate passes,
-        # defeating the whole point of merging them.
-        out_rows = {rn: self._rebuild_row(existing.get(rn, f'<row r="{rn}"></row>'),
-                                          rn, colvals)
-                   for rn, colvals in row_colvals.items()}
-        for rn, frag in existing.items():
-            if rn not in row_colvals:
-                out_rows[rn] = frag
+        pending = sorted(row_colvals)   # touched rows, ascending; may or may
+        pi = 0                          # not exist in the source
+        out_pieces = []
 
-        # clear_beyond: rows that existed before this run, sit below a
-        # pasted block, and weren't already rebuilt by a paste/set_cells
-        # write above (rows carried over unmodified from a prior month)
-        for block_cols, last_new_row in clear_specs:
-            for rn, frag in existing.items():
-                if rn > last_new_row and rn not in row_colvals:
-                    colvals = {col_letter(c): None for c in block_cols}
-                    out_rows[rn] = self._rebuild_row(frag, rn, colvals)
+        def flush_new_before(limit):
+            nonlocal pi
+            while pi < len(pending) and pending[pi] < limit:
+                rn = pending[pi]
+                out_pieces.append(self._rebuild_row(
+                    f'<row r="{rn}"></row>', rn, row_colvals[rn]))
+                pi += 1
+
+        row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*)?(?:/>|>.*?</row>)', re.S)
+        for m in row_re.finditer(body):
+            rn = int(m.group(1))
+            flush_new_before(rn)   # any pending rows strictly before rn are
+                                   # genuinely missing from the source
+            colvals = row_colvals.get(rn)
+            if colvals is not None:
+                out_pieces.append(self._rebuild_row(m.group(0), rn, colvals))
+                if pi < len(pending) and pending[pi] == rn:
+                    pi += 1        # this row existed after all — consumed
+                continue
+            cleared = False
+            for block_cols, last_new_row in clear_specs:
+                if rn > last_new_row:
+                    out_pieces.append(self._rebuild_row(
+                        m.group(0), rn, {c: None for c in map(col_letter, block_cols)}))
                     changed += len(block_cols)
+                    cleared = True
+                    break
+            if not cleared:
+                out_pieces.append(m.group(0))
+        flush_new_before(float("inf"))   # remaining rows past the last existing one
 
-        new_body = "".join(out_rows[k] for k in sorted(out_rows))
+        new_body = "".join(out_pieces)
         xml = head + new_body + tail
 
         # every set_cells ref we wrote a value into must actually be present

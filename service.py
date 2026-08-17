@@ -62,6 +62,29 @@ from pydantic import BaseModel, ConfigDict
 from surgeon import XlsxSurgeon
 from commission_job import run_extract, build_ops
 
+try:
+    import resource   # Linux/Render only — absent on Windows, diagnostic-only
+
+    def _peak_rss_mb() -> float | None:
+        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+except ImportError:
+    def _peak_rss_mb() -> float | None:
+        return None
+
+
+def _mem_checkpoint(j: dict, stage: str) -> None:
+    """Record peak RSS so far at a pipeline stage boundary — both into the
+    job status (visible while it's still running) and to stdout (Render's
+    log stream survives an OOM kill even though the in-memory JOBS dict does
+    not, so this is the one thing that lets a crash be diagnosed after the
+    fact instead of guessed at again)."""
+    mb = _peak_rss_mb()
+    if mb is None:
+        return
+    checkpoints = j.setdefault("memCheckpointsMB", {})
+    checkpoints[stage] = mb
+    print(f"[mem] peak RSS after {stage}: {mb} MB", flush=True)
+
 app = FastAPI(title="commission-workbook-surgeon")
 JOBS: dict[str, dict] = {}
 WORK = "/tmp/surgeon"
@@ -188,6 +211,7 @@ def _run(job_id: str, job: Job):
                 for chunk in r.iter_content(CHUNK_DL):
                     f.write(chunk)
         j["downloadedMB"] = round(os.path.getsize(src) / 1048576, 1)
+        _mem_checkpoint(j, "download")
 
         probes = _auto_probes(job) if job.extract else (job.probe or [])
         if probes:
@@ -196,6 +220,7 @@ def _run(job_id: str, job: Job):
                 j["formulaProbe"] = _probe_formulas(src, probes)
             except Exception as pe:  # noqa: BLE001 — the probe must never kill a job
                 j["formulaProbe"] = {"error": str(pe)[:400]}
+            _mem_checkpoint(j, "probe")
 
         if job.extract:
             j["stage"] = "extract"
@@ -227,6 +252,7 @@ def _run(job_id: str, job: Job):
                 job.ops = list(job.ops) + gen_ops  # APPEND: duplicate_sheet must run first
             else:
                 j["opsSkipped"] = "extract.applyOps=false — extract verified, no pastes generated"
+            _mem_checkpoint(j, "extract")
 
         j["stage"] = "surgery"
         s = XlsxSurgeon(src, workdir=WORK)
@@ -245,9 +271,11 @@ def _run(job_id: str, job: Job):
                                 op.get("clear_beyond", True))
             else:
                 raise ValueError(f"unknown op {kind!r}")
+        _mem_checkpoint(j, "before_apply")
         results = s.apply(dst)      # raises if no op changed a single cell
         j["opsResults"] = results
         j["outputMB"] = round(os.path.getsize(dst) / 1048576, 1)
+        _mem_checkpoint(j, "after_apply")
 
         j["stage"] = "upload"
         size = os.path.getsize(dst)
@@ -266,10 +294,12 @@ def _run(job_id: str, job: Job):
                 pos = end + 1
                 j["uploadedPct"] = round(pos / size * 100)
             final = resp.json() if resp.text else {}
+        _mem_checkpoint(j, "upload")
         j.update(status="done", stage="complete",
                  resultItemId=final.get("id"),
                  resultWebUrl=final.get("webUrl"))
     except Exception as e:  # noqa: BLE001
+        _mem_checkpoint(j, f"failed_at_{j.get('stage', 'unknown')}")
         j.update(status="failed", error=str(e)[:800],
                  trace=traceback.format_exc()[-1200:])
     finally:
