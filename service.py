@@ -206,7 +206,14 @@ def _run(job_id: str, job: Job):
                 j["extractLog"] = log_lines[-30:]
 
             data = run_extract(job.extract, log=_log)
-            gen_ops, report = build_ops(data, job.extract)
+            # the AR formula templates' prior-month XLOOKUP needs the real
+            # tab AR_07.31 (say) was duplicated FROM — derive it from the
+            # caller's own duplicate_sheet op rather than requiring n8n to
+            # send it separately.
+            dup_op = next((o for o in job.ops
+                          if o.get("op") == "duplicate_sheet"), None)
+            prior_ar_tab = dup_op["source"] if dup_op else None
+            gen_ops, report = build_ops(data, job.extract, prior_ar_tab=prior_ar_tab)
             j.update(
                 arRows=data["arCount"], salesRows=data["salesCount"],
                 arOpenBalance=data["arOpenBalance"], txnCount=data["txnCount"],
@@ -278,7 +285,7 @@ def _run(job_id: str, job: Job):
                 pass
 
 
-VERSION = "2026-08-17-extract-v4-perf"
+VERSION = "2026-08-17-extract-v5-formulas"
 
 
 @app.get("/health")
