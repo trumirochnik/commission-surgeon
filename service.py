@@ -203,6 +203,7 @@ def _run(job_id: str, job: Job):
     j = JOBS[job_id]
     src = os.path.join(WORK, f"{job_id}_src.xlsx")
     dst = os.path.join(WORK, f"{job_id}_out.xlsx")
+    mid = os.path.join(WORK, f"{job_id}_mid.xlsx")   # phase-1 output for a 2-phase surgery
     try:
         j.update(status="running", stage="download")
         with requests.get(job.downloadUrl, stream=True, timeout=600) as r:
@@ -255,27 +256,67 @@ def _run(job_id: str, job: Job):
             _mem_checkpoint(j, "extract")
 
         j["stage"] = "surgery"
-        s = XlsxSurgeon(src, workdir=WORK)
-        for op in job.ops:
-            kind = op["op"]
-            if kind == "set_cells":
-                s.set_cells(op["sheet"], op["cells"])
-            elif kind == "append_rows":
-                s.append_rows(op["sheet"], op["rows"])
-            elif kind == "add_sheet":
-                s.add_sheet(op["name"], op["rows"])
-            elif kind == "duplicate_sheet":
-                s.duplicate_sheet(op["source"], op["name"])
-            elif kind == "paste_columns":
-                s.paste_columns(op["sheet"], op["anchor"], op["rows"],
-                                op.get("clear_beyond", True))
-            else:
-                raise ValueError(f"unknown op {kind!r}")
-        _mem_checkpoint(j, "before_apply")
-        results = s.apply(dst)      # raises if no op changed a single cell
+        # Split into two sequential apply() calls when an extract ran: AR's
+        # duplicate+paste+formulas (~16k rows) and the sales sheet's own
+        # paste+formulas (~13.5k rows) are each big enough to matter on
+        # their own, and doing them in the SAME apply() call means their
+        # transient overhead can be simultaneously resident even after each
+        # op is logically done — CPython's allocator often doesn't return
+        # freed memory to the OS within a long-running process, so RSS can
+        # stay elevated from phase 1 while phase 2 is still running. Writing
+        # phase 1's result to a local temp file and opening a BRAND NEW
+        # XlsxSurgeon on it for phase 2 means phase 1's surgeon instance,
+        # its queued ops, and its transform temporaries are all out of scope
+        # before phase 2 begins — the two phases' peaks never overlap. The
+        # extra round-trip is local disk I/O (fast), not network.
+        ar_target = ((job.extract or {}).get("ar") or {}).get("target")
+        phase1_ops, phase2_ops = list(job.ops), []
+        if ar_target:
+            phase1_ops, phase2_ops = [], []
+            for op in job.ops:
+                is_ar_or_dash = (
+                    (op["op"] == "duplicate_sheet" and op.get("name") == ar_target)
+                    or op.get("sheet") in (ar_target, "Dashboard"))
+                (phase1_ops if is_ar_or_dash else phase2_ops).append(op)
+
+        def _run_ops(surgeon, ops):
+            for op in ops:
+                kind = op["op"]
+                if kind == "set_cells":
+                    surgeon.set_cells(op["sheet"], op["cells"])
+                elif kind == "append_rows":
+                    surgeon.append_rows(op["sheet"], op["rows"])
+                elif kind == "add_sheet":
+                    surgeon.add_sheet(op["name"], op["rows"])
+                elif kind == "duplicate_sheet":
+                    surgeon.duplicate_sheet(op["source"], op["name"])
+                elif kind == "paste_columns":
+                    surgeon.paste_columns(op["sheet"], op["anchor"], op["rows"],
+                                          op.get("clear_beyond", True))
+                else:
+                    raise ValueError(f"unknown op {kind!r}")
+
+        if phase2_ops:
+            s1 = XlsxSurgeon(src, workdir=WORK)
+            _run_ops(s1, phase1_ops)
+            _mem_checkpoint(j, "before_apply_phase1")
+            results1 = s1.apply(mid)
+            _mem_checkpoint(j, "after_apply_phase1")
+            del s1   # ensure phase 1's surgeon/ops are out of scope before phase 2
+            s2 = XlsxSurgeon(mid, workdir=WORK)   # fresh read from the intermediate
+            _run_ops(s2, phase2_ops)
+            _mem_checkpoint(j, "before_apply_phase2")
+            results2 = s2.apply(dst)
+            _mem_checkpoint(j, "after_apply_phase2")
+            results = results1 + results2
+        else:
+            s = XlsxSurgeon(src, workdir=WORK)
+            _run_ops(s, phase1_ops)
+            _mem_checkpoint(j, "before_apply")
+            results = s.apply(dst)
+            _mem_checkpoint(j, "after_apply")
         j["opsResults"] = results
         j["outputMB"] = round(os.path.getsize(dst) / 1048576, 1)
-        _mem_checkpoint(j, "after_apply")
 
         j["stage"] = "upload"
         size = os.path.getsize(dst)
@@ -306,7 +347,7 @@ def _run(job_id: str, job: Job):
         keep = {dst} if (job.keepResult and os.path.exists(dst)) else set()
         if keep:
             j["resultPath"] = dst
-        for p in (src, dst):
+        for p in (src, dst, mid):
             if p in keep:
                 continue
             try:
