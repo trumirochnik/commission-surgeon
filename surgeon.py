@@ -168,6 +168,36 @@ class XlsxSurgeon:
             raise KeyError(f"sheet {new_name!r} already exists")
         self._ops.append(("dup", new_name, source))
 
+    def retarget_refs(self, sheet: str, replace: list):
+        """Rewrite cross-sheet references in one sheet's formulas, e.g.
+        [{"from": "AR_05.31", "to": "AR_06.30"}]. Matches both the quoted
+        ('AR_05.31'!) and unquoted (AR_05.31!) forms. Exists because
+        duplicate_sheet copies formulas verbatim: the July tab copied from
+        June inherits June's prior-month (May) references, silently
+        comparing July against May — and every future month inherits the
+        same off-by-one. apply() FAILS the job if a supplied mapping makes
+        zero replacements: a silent no-op here is exactly how that bug
+        shipped."""
+        if not replace or not all(m.get("from") and m.get("to") for m in replace):
+            raise ValueError("retarget_refs needs replace=[{'from':...,'to':...}]")
+        pending_dup = any(o[0] == "dup" and o[1] == sheet for o in self._ops)
+        if sheet not in self._sheet_parts and not pending_dup:
+            raise KeyError(f"sheet {sheet!r} not found; have {self.sheet_names()}")
+        self._ops.append(("retarget", sheet, list(replace)))
+
+    @staticmethod
+    def _apply_retargets(text: str, replaces: list) -> tuple[str, int]:
+        """Apply every {from,to} mapping; returns (text, replacement count)."""
+        count = 0
+        for m in replaces:
+            frm, to = m["from"], m["to"]
+            for pat, rep in ((f"'{frm}'", f"'{to}'"), (f"{frm}!", f"{to}!")):
+                n = text.count(pat)
+                if n:
+                    text = text.replace(pat, rep)
+                    count += n
+        return text, count
+
     def paste_columns(self, sheet: str, anchor: str, rows: list,
                       clear_beyond: bool = True):
         """Overwrite a rectangular block starting at `anchor` (e.g. 'A7') with
@@ -183,6 +213,7 @@ class XlsxSurgeon:
 
     # -- application -------------------------------------------------------
     def apply(self, dst_path: str):
+        self._retarget_counts: dict[str, int] = {}
         # group ops per existing part
         per_part: dict[str, dict] = {}
         new_sheets = []
@@ -197,11 +228,14 @@ class XlsxSurgeon:
             if target not in self._sheet_parts:
                 continue   # targets a duplicated sheet; handled at duplication time
             part = self._sheet_parts[target]
-            per_part.setdefault(part, {"set": {}, "append": [], "paste": []})
+            per_part.setdefault(part, {"set": {}, "append": [], "paste": [],
+                                       "retarget": []})
             if kind == "set":
                 per_part[part]["set"].update(payload[0])
             elif kind == "paste":
                 per_part[part]["paste"].append(payload)
+            elif kind == "retarget":
+                per_part[part]["retarget"].extend(payload)
             else:
                 per_part[part]["append"].append(payload)
 
@@ -217,9 +251,12 @@ class XlsxSurgeon:
                     src_size = zf.getinfo(src_part).file_size
                     print(f"[mem] duplicate_sheet {source!r}: source part is "
                          f"{round(src_size / 1048576, 1)} MB decompressed", flush=True)
-                    pend = [o for o in self._ops if o[1] == new_name and o[0] in ("paste", "set")]
+                    pend = [o for o in self._ops if o[1] == new_name
+                            and o[0] in ("paste", "set", "retarget")]
                     paste_groups = [p[2] for p in pend if p[0] == "paste"]
                     cell_groups = [p[2][0] for p in pend if p[0] == "set"]
+                    retargets = [m for p in pend if p[0] == "retarget"
+                                 for m in p[2]]
 
                     if self._stream_ok(paste_groups, cell_groups):
                         _mem_log(f"before streaming rebuild of {source!r}")
@@ -228,7 +265,8 @@ class XlsxSurgeon:
                         with zf.open(src_part) as fin:
                             changed = 1 + self._stream_rebuild_rows(
                                 fin, tmp, paste_groups, cell_groups,
-                                f"duplicate of {source!r}", authored_copy=True)
+                                f"duplicate of {source!r}", authored_copy=True,
+                                retargets=retargets, retarget_key=new_name)
                         _mem_log(f"after streaming rebuild of {source!r}")
                         results.append({"target": new_name,
                                         "kind": "duplicate_sheet",
@@ -257,6 +295,11 @@ class XlsxSurgeon:
                         xml, n = self._apply_row_ops(xml, paste_groups, cell_groups)
                         changed += n
                         _mem_log(f"after paste/set_cells on duplicated {new_name!r}")
+                    if retargets:
+                        xml, n = self._apply_retargets(xml, retargets)
+                        self._retarget_counts[new_name] = (
+                            self._retarget_counts.get(new_name, 0) + n)
+                        changed += n
                     results.append({"target": new_name, "kind": "duplicate_sheet",
                                     "sourcePartMB": round(src_size / 1048576, 1),
                                     "cellsChanged": changed})
@@ -344,7 +387,9 @@ class XlsxSurgeon:
                         tmp_in, tmp_out,
                         per_part[name]["set"],
                         per_part[name]["append"],
-                        per_part[name].get("paste", []))
+                        per_part[name].get("paste", []),
+                        per_part[name].get("retarget", []),
+                        retarget_key=part_to_name.get(name, name))
                     # transforms only rewrite <row>/<c> content, which never
                     # carries r:id, and the part's own _rels streams through
                     # untouched — so no dangling-rid scan is needed here.
@@ -380,7 +425,23 @@ class XlsxSurgeon:
                 self._assert_no_dangling_rids(part, xml, ())
                 zout.writestr(part, xml)
 
-        if sum(r["cellsChanged"] for r in results) == 0:
+        # every supplied retarget mapping must have actually hit something —
+        # a silent no-op here is exactly how a stale prior-month reference
+        # shipped into a delivered workbook
+        for kind, target, payload in self._ops:
+            if kind == "retarget":
+                n = self._retarget_counts.get(target, 0)
+                if n == 0:
+                    raise ValueError(
+                        f"retarget_refs on {target!r} made 0 replacements for "
+                        f"{payload} — refusing: either the mapping is wrong or "
+                        "the stale references it was meant to fix don't exist")
+        for sheet, n in self._retarget_counts.items():
+            results.append({"target": sheet, "kind": "retarget_refs",
+                            "replacements": n, "cellsChanged": 0})
+
+        if sum(r["cellsChanged"] for r in results) == 0 \
+                and not self._retarget_counts:
             raise ValueError(
                 "no op changed anything — refusing to upload an unmodified file")
         return results
@@ -417,7 +478,9 @@ class XlsxSurgeon:
 
     def _stream_rebuild_rows(self, fin, dst_path: str, paste_groups: list,
                              cell_groups: list, label: str,
-                             authored_copy: bool) -> int:
+                             authored_copy: bool,
+                             retargets: list | None = None,
+                             retarget_key: str | None = None) -> int:
         """Rebuild a sheet's entire data region without ever holding the
         source part (or the result) in memory.
 
@@ -539,6 +602,14 @@ class XlsxSurgeon:
                             prefix, count=1)
             self._assert_no_dangling_rids(f"{label} (prefix)", prefix, ())
             self._assert_no_dangling_rids(f"{label} (suffix)", suffix, ())
+        rkey = retarget_key or label
+        if retargets:
+            # header rows / suffix carry the source's formulas verbatim, and
+            # generated cell values might too if a caller passes stale refs
+            prefix, n1 = self._apply_retargets(prefix, retargets)
+            suffix, n2 = self._apply_retargets(suffix, retargets)
+            self._retarget_counts[rkey] = (
+                self._retarget_counts.get(rkey, 0) + n1 + n2)
 
         # ---- write: prefix + generated rows (batched) + suffix
         changed = 0
@@ -548,6 +619,14 @@ class XlsxSurgeon:
             for rn in sorted(row_vals):
                 d = row_vals[rn]
                 values = [d.get(c) for c in range(1, max_col + 1)]
+                if retargets:
+                    for i, v in enumerate(values):
+                        if isinstance(v, str) and v.startswith("="):
+                            v2, n = self._apply_retargets(v, retargets)
+                            if n:
+                                values[i] = v2
+                                self._retarget_counts[rkey] = (
+                                    self._retarget_counts.get(rkey, 0) + n)
                 batch.append(row_xml(rn, values))
                 changed += len(d)
                 if len(batch) >= 512:
@@ -577,7 +656,9 @@ class XlsxSurgeon:
                 f'org/officeDocument/2006/relationships">'
                 f'<dimension ref="{dim}"/><sheetData>{body}</sheetData></worksheet>')
 
-    def _transform_sheet(self, src, dst, set_cells, append_groups, paste_groups=None):
+    def _transform_sheet(self, src, dst, set_cells, append_groups,
+                         paste_groups=None, retarget_groups=None,
+                         retarget_key=None):
         """
         Disk-based transform of one worksheet part.
         Strategy: the file is processed as head (first chunk, holds <dimension>),
@@ -602,11 +683,13 @@ class XlsxSurgeon:
             with open(src, "rb") as fin:
                 changed = self._stream_rebuild_rows(
                     fin, dst, paste_groups, [set_cells] if set_cells else [],
-                    os.path.basename(src), authored_copy=False)
+                    os.path.basename(src), authored_copy=False,
+                    retargets=retarget_groups or None,
+                    retarget_key=retarget_key)
             _mem_log("after streaming rebuild of existing part")
             return changed
 
-        if set_cells or paste_groups:
+        if set_cells or paste_groups or retarget_groups:
             if size > 32 * 1024 * 1024:
                 raise ValueError("set_cells only supported on sheets < 32MB "
                                  "decompressed; use append_rows for data tabs")
@@ -620,6 +703,12 @@ class XlsxSurgeon:
             if paste_groups or set_cells:
                 xml, n = self._apply_row_ops(
                     xml, paste_groups or [], [set_cells] if set_cells else [])
+                changed += n
+            if retarget_groups:
+                xml, n = self._apply_retargets(xml, retarget_groups)
+                key = retarget_key or os.path.basename(src)
+                self._retarget_counts[key] = (
+                    self._retarget_counts.get(key, 0) + n)
                 changed += n
             if append_groups:
                 xml, n = self._apply_append_inmem(xml, append_groups)

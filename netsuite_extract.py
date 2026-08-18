@@ -199,20 +199,38 @@ class Mcp:
 
 # ─────────────────────────── helpers ───────────────────────────
 
-def serial(v: Any) -> Any:
-    """Excel serial date. NetSuite hands back M/D/YYYY or ISO."""
+def to_date(v: Any) -> dt.date | None:
+    """Parse NetSuite's M/D/YYYY or ISO date strings."""
     if v in (None, ""):
         return None
     s = str(v)
     m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})", s)
     if m:
-        d = dt.date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
-    else:
-        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
-        if not m:
-            return v
-        d = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return dt.date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+
+def serial(v: Any) -> Any:
+    """Excel serial date. NetSuite hands back M/D/YYYY or ISO."""
+    d = to_date(v)
+    if d is None:
+        return None if v in (None, "") else v
     return (d - EXCEL_EPOCH).days
+
+
+_MON3 = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def month_label(v: Any) -> Any:
+    """'6/15/2026' -> 'Jun 2026' — the sales tabs' W column format, matched
+    to existing rows ('Oct 2022', 'Jun 2026'). Manual month names, not
+    strftime, so a non-English server locale can't change the output."""
+    d = to_date(v)
+    return f"{_MON3[d.month - 1]} {d.year}" if d else None
 
 
 def num(v: Any) -> Any:
@@ -293,14 +311,16 @@ ORDER BY t.id
 
 
 def q_sales_lines(ids: list[str]) -> str:
-    """Rule 2: transaction + transactionline + item ONLY."""
+    """Rule 2: transaction + transactionline + item ONLY.
+    (tl.rate was dropped 2026-08-18 — it was only ever written into the
+    sales tabs' Y column, which is actually 'Company name' in the layout.)"""
     return f"""
 SELECT
   BUILTIN.DF(t.entity) AS c01, t.trandate AS c02, BUILTIN.DF(t.type) AS c03,
   t.tranid AS c04, i.itemid AS c05, tl.quantity AS c06, tl.foreignamount AS c07,
   BUILTIN.DF(t.employee) AS c08, BUILTIN.DF(t.partner) AS c09,
   BUILTIN.DF(t.status) AS c10, t.duedate AS c11, t.closedate AS c12,
-  tl.rate AS c13, t.id AS c14, t.entity AS c15
+  t.id AS c14, t.entity AS c15
 FROM transaction t
 JOIN transactionline tl ON tl.transaction = t.id AND tl.mainline = 'F'
 JOIN item i ON i.id = tl.item
@@ -327,7 +347,8 @@ SELECT cu.id AS c01,
   cu.firstsaledate AS c04,
   BUILTIN.DF(cu.custentitystore_type) AS c05,
   cu.companyname AS c06,
-  BUILTIN.DF(cu.partner) AS c07
+  BUILTIN.DF(cu.partner) AS c07,
+  BUILTIN.DF(cu.custentity12) AS c08
 FROM customer cu
 WHERE cu.id IN ({','.join(ids)})
 ORDER BY cu.id
@@ -352,7 +373,22 @@ WHERE i.itemid IN ({sql_list(ids)})
 # ─────────────────────────── dimensions ───────────────────────────
 
 def fetch_customers(mcp: Mcp, ids: list[str]) -> dict[str, dict]:
-    """Rule 3: by id, for only the ids seen on the lines."""
+    """Rule 3: by id, for only the ids seen on the lines.
+
+    commission_pct: customer field custentity12, a SELECT field whose option
+    LABELS are the whole-number percents {5,7,10,14,15,20} — VERIFIED
+    2026-08-18 against five customers whose saved-search "Commission Pct"
+    values were known (Johnson's 10, American Man 20, Cavenders#34 5,
+    Cattleman 14, Walker 7). BUILTIN.DF gives the label; the raw column is
+    the option's internal id (1..6) and must NOT be used directly. Stored
+    here as a fraction (10 -> 0.10) to match the workbook's rate convention
+    (the AA fallback is 0.1, the Y column emits 0.05/0.09/...)."""
+    def pct(label):
+        try:
+            return float(label) / 100.0 if label not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
     out: dict[str, dict] = {}
     for batch in chunks(ids, CUST_BATCH):
         for r in mcp.rows(q_customers(batch), "customer dim"):
@@ -360,6 +396,7 @@ def fetch_customers(mcp: Mcp, ids: list[str]) -> dict[str, dict]:
                 "type": g(r, 2), "category": g(r, 3),
                 "first_sale": serial(g(r, 4)), "store_type": g(r, 5),
                 "company": g(r, 6), "partner": g(r, 7),
+                "commission_pct": pct(g(r, 8)),
             }
     return out
 
@@ -407,6 +444,37 @@ def fetch_states(mcp: Mcp, ids: list[str]) -> dict[str, str]:
     return out
 
 
+def q_accounts(ids: list[str]) -> str:
+    """AR column W 'Account: Name (GL-style)' keyed by TRANSACTION id.
+
+    VERIFIED 2026-08-18: the transaction HEADER carries the receivables
+    account directly — BUILTIN.DF(t.account) = '11300 Accounts Receivable -
+    Trade' for tran 29506822 — so no transactionaccountingline join is
+    needed at all (putting that join in the line query is what collapsed
+    the plan originally). Keyed-id batches only, same pattern as
+    fetch_states(); the `account` table itself is permission-blocked for
+    this credential, which is fine since DF does the naming."""
+    return f"""
+SELECT t.id AS c01, BUILTIN.DF(t.account) AS c02
+FROM transaction t
+WHERE t.id IN ({','.join(ids)})
+""".strip()
+
+
+def fetch_accounts(mcp: Mcp, ids: list[str]) -> dict[str, str]:
+    """{txn id: '11300 - Accounts Receivable - Trade'}. BUILTIN.DF returns
+    '11300 Accounts Receivable - Trade'; the workbook/saved-search format
+    has a dash after the number (ground truth: the AGA saved-search CSV) —
+    inserted here."""
+    out: dict[str, str] = {}
+    for batch in chunks(ids, CUST_BATCH):
+        for r in mcp.rows(q_accounts(batch), "AR account dim"):
+            name = g(r, 2)
+            if name:
+                out[str(g(r, 1))] = re.sub(r"^(\d+)\s+", r"\1 - ", str(name))
+    return out
+
+
 def _dim_lookup(cust: dict | None, key: str) -> Any:
     """Safe read from the customer dimension — the row may have no match."""
     return cust.get(key) if cust else None
@@ -414,14 +482,15 @@ def _dim_lookup(cust: dict | None, key: str) -> Any:
 
 def build_ar_rows(raw: list[dict], cust: dict[str, dict],
                   items: dict[str, str], states: dict[str, str],
-                  partners: dict[str, str], sign_flip: bool) -> list[list]:
+                  partners: dict[str, str], accounts: dict[str, str],
+                  sign_flip: bool) -> list[list]:
     """24 values per row -> AR tab columns A:X.
 
     A Client:Project   B Customer_Type   C Client Category  D First Sale Date
     E Store_Type       F Date            G Transaction      H No.
     I Item: Full Name  J Item: Desc      K Quantity         L Open Balance
     M Sales Rep        N Address(state)  O Partner          P Partner Role
-    Q Commission %     R Txn status      S Due Date         T Date Closed
+    Q Commission Pct   R Txn status      S Due Date         T Date Closed
     U Primary Partner  V Amount (Gross)  W Account: Name    X Company Name
     """
     sf = -1 if sign_flip else 1
@@ -466,13 +535,13 @@ def build_ar_rows(raw: list[dict], cust: dict[str, dict],
             states.get(str(g(r, 14))),
             partner,
             partners.get(str(partner).strip(), PARTNER_ROLE_FALLBACK) if partner else None,
-            None,                                   # rule 6: commission % empty
+            _dim_lookup(c, "commission_pct"),       # Q: customer custentity12 / 100
             g(r, 10),
             serial(g(r, 11)),
             serial(g(r, 12)),
             _dim_lookup(c, "partner"),
             gross * sf if isinstance(gross, float) else gross,
-            None,                                   # W Account: Name (GL) — formula
+            accounts.get(str(g(r, 14))),            # W: header AR account, DF'd
             company,
         ])
 
@@ -483,9 +552,21 @@ def build_ar_rows(raw: list[dict], cust: dict[str, dict],
 
 def build_sales_rows(raw: list[dict], cust: dict[str, dict],
                      items: dict[str, str], states: dict[str, str],
-                     partners: dict[str, str], sign_flip: bool) -> list[list]:
+                     asof_serial: int, sign_flip: bool) -> list[list]:
     """25 values per row -> New Sales report / Sales report Raw columns A:Y.
-    Same A:X shape as AR, plus Y = rate."""
+
+    A:V match the AR layout EXCEPT P, and the W/X/Y tail differs — read off
+    the delivered workbook 2026-08-18 (this used to be a copy of the AR
+    shape, which is exactly how W/X/Y and P shipped wrong):
+
+    L Amount           (same position AR calls "Open Balance")
+    P Client: Partner  (the CUSTOMER's partner — a person — not the
+                        partner-record category/role AR carries here)
+    Q Commission Pct   (customer custentity12 / 100)
+    W Month            ("Jun 2026" — the row's own date, %b %Y)
+    X Client Age (Yrs) (years from firstsaledate to the period end, 2dp)
+    Y Company name
+    """
     sf = -1 if sign_flip else 1
     out: list[list] = []
     skipped_partner = skipped_company = unmatched = 0
@@ -504,13 +585,16 @@ def build_sales_rows(raw: list[dict], cust: dict[str, dict],
             skipped_company += 1
             continue
 
-        qty, amt, rate = num(g(r, 6)), num(g(r, 7)), num(g(r, 13))
+        qty, amt = num(g(r, 6)), num(g(r, 7))
         item_id = g(r, 5)
+        first_sale = _dim_lookup(c, "first_sale")
+        client_age = (round((asof_serial - first_sale) / 365.25, 2)
+                      if isinstance(first_sale, (int, float)) else None)
         out.append([
             g(r, 1),
             _dim_lookup(c, "type"),
             _dim_lookup(c, "category"),
-            _dim_lookup(c, "first_sale"),
+            first_sale,
             _dim_lookup(c, "store_type"),
             serial(g(r, 2)),
             g(r, 3),
@@ -522,16 +606,16 @@ def build_sales_rows(raw: list[dict], cust: dict[str, dict],
             employee_label(g(r, 8)),
             states.get(str(g(r, 14))),
             partner,
-            partners.get(str(partner).strip(), PARTNER_ROLE_FALLBACK) if partner else None,
-            None,
+            _dim_lookup(c, "partner"),              # P: Client: Partner (a person)
+            _dim_lookup(c, "commission_pct"),       # Q: customer custentity12 / 100
             g(r, 10),
             serial(g(r, 11)),
             serial(g(r, 12)),
-            _dim_lookup(c, "partner"),
+            _dim_lookup(c, "partner"),              # U: Primary Partner: Name
             amt * sf if isinstance(amt, float) else amt,
-            None,
-            company,
-            rate,
+            month_label(g(r, 2)),                   # W: "Jun 2026"
+            client_age,                             # X: Client Age (Years)
+            company,                                # Y: Company name
         ])
 
     return out, {"skipped_partner": skipped_partner,
@@ -679,10 +763,13 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
         log(f"[dim] add these to EMPLOYEE_NAMES: {', '.join(unmapped)}")
 
     txn_ids = sorted({str(g(r, 14)) for r in ar_raw + sales_raw if g(r, 14)})
+    ar_txn_ids = sorted({str(g(r, 14)) for r in ar_raw if g(r, 14)})
     states = fetch_states(mcp, txn_ids)
     partners = fetch_partners(mcp)
+    accounts = fetch_accounts(mcp, ar_txn_ids)   # AR col W (header AR account)
     log(f"[dim] {len(partners)} partner categories")
     log(f"[dim] {len(states)} shipping states")
+    log(f"[dim] {len(accounts)} AR accounts")
     cust = fetch_customers(mcp, ent_ids)
     items: dict[str, str] = {}
     for batch in chunks(item_ids, CUST_BATCH):
@@ -691,8 +778,11 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
             if desc:
                 items[str(g(r, 1))] = re.sub(r"\s+", " ", str(desc)).strip()
 
-    ar_rows, ar_diag = build_ar_rows(ar_raw, cust, items, states, partners, sign_flip)
-    sales_rows, sales_diag = build_sales_rows(sales_raw, cust, items, states, partners, sign_flip)
+    asof_serial = serial(asof)
+    ar_rows, ar_diag = build_ar_rows(ar_raw, cust, items, states, partners,
+                                     accounts, sign_flip)
+    sales_rows, sales_diag = build_sales_rows(sales_raw, cust, items, states,
+                                              asof_serial, sign_flip)
 
     ar_total = sum(r[11] for r in ar_rows if isinstance(r[11], float))
     sales_total = sum(r[11] for r in sales_rows if isinstance(r[11], float))
@@ -707,7 +797,8 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
                         "customers": len(cust), "employeeCodes": len(emp_codes),
                         "employeesUnmapped": unmapped,
                         "items": len(items), "states": len(states),
-                        "partners": len(partners), "signFlip": sign_flip},
+                        "partners": len(partners), "arAccounts": len(accounts),
+                        "signFlip": sign_flip},
     }
 
 

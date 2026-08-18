@@ -35,9 +35,18 @@ Job request body:
                "raw":   {"target": "Sales report Raw", "anchor": "A4", "formulaCols": "Z:AA"} },
   "ops": [
     {"op": "duplicate_sheet", "source": "AR_06.30", "name": "AR_07.31"},
-    {"op": "set_cells",   "sheet": "Dashboard", "cells": {"C2": "July'26"}}
+    {"op": "set_cells",   "sheet": "Dashboard", "cells": {"C2": "July'26"}},
+    {"op": "retarget_refs", "sheet": "AR_07.31",
+     "replace": [{"from": "AR_05.31", "to": "AR_06.30"}]}
   ]
 }
+
+retarget_refs: rewrites cross-sheet references in one sheet's formulas —
+the duplicated AR tab inherits the SOURCE month's prior-month references
+(July's tab copied from June still points at May), so n8n should send
+from = two-months-back tab name, to = the duplicate_sheet source. Both
+'AR_05.31'! (quoted) and AR_05.31! (unquoted) forms are matched. The job
+FAILS if a supplied mapping makes zero replacements.
 Unknown top-level fields are REJECTED (422). This is deliberate: the model
 used to ignore extras, and a payload whose `extract` block was silently
 dropped reported "done" after uploading an unmodified 111MB file.
@@ -365,6 +374,8 @@ def _run(job_id: str, job: Job):
                 elif kind == "paste_columns":
                     surgeon.paste_columns(op["sheet"], op["anchor"], op["rows"],
                                           op.get("clear_beyond", True))
+                elif kind == "retarget_refs":
+                    surgeon.retarget_refs(op["sheet"], op["replace"])
                 else:
                     raise ValueError(f"unknown op {kind!r}")
 
