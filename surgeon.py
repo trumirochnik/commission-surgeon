@@ -168,6 +168,53 @@ class XlsxSurgeon:
             raise KeyError(f"sheet {new_name!r} already exists")
         self._ops.append(("dup", new_name, source))
 
+    def copy_range_values(self, sheet: str, src_range: str, dst_range: str):
+        """SOP step 2 (the balance roll): copy one range's CACHED VALUES over
+        another range as literals — never formulas, or next month's roll
+        would chain and compound. Reads the source range's cached <v> from
+        the sheet as it stands BEFORE this job's recalc-on-open (on the
+        commission workbook that means the PRIOR month's ending balances,
+        exactly what the roll wants). Geometry must match; shared-string
+        sources are refused (the Dashboard roll columns are numeric)."""
+        if sheet not in self._sheet_parts:
+            raise KeyError(f"sheet {sheet!r} not found; have {self.sheet_names()}")
+        import xlsx_read as _xr
+        s_lo, s_hi, s_rlo, s_rhi = _xr.parse_range(src_range)
+        d_lo, d_hi, d_rlo, d_rhi = _xr.parse_range(dst_range)
+        if None in (s_rlo, d_rlo):
+            raise ValueError("copy_range_values needs bounded ranges (e.g. W6:W24)")
+        if (s_hi - s_lo, s_rhi - s_rlo) != (d_hi - d_lo, d_rhi - d_rlo):
+            raise ValueError(
+                f"copy_range_values geometry mismatch: {src_range} is "
+                f"{s_rhi-s_rlo+1}x{s_hi-s_lo+1}, {dst_range} is "
+                f"{d_rhi-d_rlo+1}x{d_hi-d_lo+1} — refusing to roll misaligned")
+        self._ops.append(("copyvals", sheet, (src_range, dst_range)))
+
+    @staticmethod
+    def _read_range_cached(xml: str, rng: str) -> dict:
+        """{dst-offset (r,c): literal value} of a bounded range's cached
+        values, read straight from the part text. Formula cells yield their
+        cached <v>; blanks yield None; shared-string cells are refused."""
+        import xlsx_read as _xr
+        c_lo, c_hi, r_lo, r_hi = _xr.parse_range(rng)
+        out = {}
+        row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*)?(?:/>|>.*?</row>)', re.S)
+        for m in row_re.finditer(xml):
+            rn = int(m.group(1))
+            if rn < r_lo or rn > r_hi:
+                continue
+            cells = _xr.parse_row_cells(m.group(0))
+            for ci in range(c_lo, c_hi + 1):
+                cell = cells.get(_xr.col_letter(ci))
+                if cell is None:
+                    continue
+                if cell.get("t") == "s":
+                    raise ValueError(
+                        f"copy_range_values: {rng} contains shared-string "
+                        "cells — only numeric/inline sources are supported")
+                out[(rn - r_lo, ci - c_lo)] = _xr.cell_value(cell, {})
+        return out
+
     def retarget_refs(self, sheet: str, replace: list):
         """Rewrite cross-sheet references in one sheet's formulas, e.g.
         [{"from": "AR_05.31", "to": "AR_06.30"}]. Matches both the quoted
@@ -249,13 +296,15 @@ class XlsxSurgeon:
                 continue   # targets a duplicated sheet; handled at duplication time
             part = self._sheet_parts[target]
             per_part.setdefault(part, {"set": {}, "append": [], "paste": [],
-                                       "retarget": []})
+                                       "retarget": [], "copyvals": []})
             if kind == "set":
                 per_part[part]["set"].update(payload[0])
             elif kind == "paste":
                 per_part[part]["paste"].append(payload)
             elif kind == "retarget":
                 per_part[part]["retarget"].extend(payload)
+            elif kind == "copyvals":
+                per_part[part]["copyvals"].append(payload)
             else:
                 per_part[part]["append"].append(payload)
 
@@ -415,7 +464,8 @@ class XlsxSurgeon:
                         per_part[name]["append"],
                         per_part[name].get("paste", []),
                         per_part[name].get("retarget", []),
-                        retarget_key=part_to_name.get(name, name))
+                        retarget_key=part_to_name.get(name, name),
+                        copyvals_groups=per_part[name].get("copyvals", []))
                     # transforms only rewrite <row>/<c> content, which never
                     # carries r:id, and the part's own _rels streams through
                     # untouched — so no dangling-rid scan is needed here.
@@ -685,7 +735,7 @@ class XlsxSurgeon:
 
     def _transform_sheet(self, src, dst, set_cells, append_groups,
                          paste_groups=None, retarget_groups=None,
-                         retarget_key=None):
+                         retarget_key=None, copyvals_groups=None):
         """
         Disk-based transform of one worksheet part.
         Strategy: the file is processed as head (first chunk, holds <dimension>),
@@ -703,8 +753,11 @@ class XlsxSurgeon:
         # below on Render even after every in-memory optimization. The
         # sheet's own _rels part streams through untouched, so prefix/suffix
         # pass verbatim (r:id refs stay valid — no stripping).
-        if self._stream_ok(paste_groups or [], [set_cells] if set_cells else [],
-                           append_groups):
+        if copyvals_groups is None:
+            copyvals_groups = []
+        if not copyvals_groups and self._stream_ok(
+                paste_groups or [], [set_cells] if set_cells else [],
+                append_groups):
             _mem_log(f"before streaming rebuild of existing part "
                      f"({round(size / 1048576, 1)} MB)")
             with open(src, "rb") as fin:
@@ -716,12 +769,26 @@ class XlsxSurgeon:
             _mem_log("after streaming rebuild of existing part")
             return changed
 
-        if set_cells or paste_groups or retarget_groups:
+        if set_cells or paste_groups or retarget_groups or copyvals_groups:
             if size > 32 * 1024 * 1024:
                 raise ValueError("set_cells only supported on sheets < 32MB "
                                  "decompressed; use append_rows for data tabs")
             with open(src, "r", encoding="utf-8") as f:
                 xml = f.read()
+            if copyvals_groups:
+                # SOP step 2: source values are read from the sheet AS IT
+                # STANDS (prior month's cached endings), then written as
+                # literals through the same diff-aware set_cells path
+                import xlsx_read as _xr
+                set_cells = dict(set_cells or {})
+                for src_rng, dst_rng in copyvals_groups:
+                    vals = self._read_range_cached(xml, src_rng)
+                    d_lo, d_hi, d_rlo, d_rhi = _xr.parse_range(dst_rng)
+                    for r_off in range(d_rhi - d_rlo + 1):
+                        for c_off in range(d_hi - d_lo + 1):
+                            ref = (f"{_xr.col_letter(d_lo + c_off)}"
+                                   f"{d_rlo + r_off}")
+                            set_cells[ref] = vals.get((r_off, c_off))
             # ONE merged extract/rebuild/join for whatever combination of
             # paste_columns + set_cells targets this sheet, instead of one
             # full pass per op — see _apply_row_ops. On a real month's file

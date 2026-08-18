@@ -734,6 +734,8 @@ def _run(job_id: str, job: Job):
                                           op.get("clear_beyond", True))
                 elif kind == "retarget_refs":
                     surgeon.retarget_refs(op["sheet"], op["replace"])
+                elif kind == "copy_range_values":
+                    surgeon.copy_range_values(op["sheet"], op["from"], op["to"])
                 else:
                     raise ValueError(f"unknown op {kind!r}")
 
@@ -828,7 +830,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-19-extract-v18-phaseA"
+VERSION = "2026-08-20-v19-rollop"
 
 
 @app.get("/health")
