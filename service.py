@@ -153,7 +153,11 @@ def _probe_formulas(src: str, probes: list[dict]) -> dict:
     Streams only the head of each sheet part: target rows sit near the top,
     and 'Sales report Raw' is far too large to hold in memory."""
     s = XlsxSurgeon(src, workdir=WORK)
-    out: dict = {"formulas": {}, "tables": {}, "errors": []}
+    # sheetNames = the SOURCE workbook's tab inventory, before any ops run.
+    # Lets a stray tab (e.g. "AR_1.31 (2)") be attributed to the source
+    # month's file vs something this job created, without opening 111MB.
+    out: dict = {"formulas": {}, "tables": {}, "errors": [],
+                 "sheetNames": s.sheet_names()}
     with zipfile.ZipFile(src) as zf:
         names = set(zf.namelist())
         for p in probes:

@@ -186,17 +186,37 @@ class XlsxSurgeon:
         self._ops.append(("retarget", sheet, list(replace)))
 
     @staticmethod
-    def _apply_retargets(text: str, replaces: list) -> tuple[str, int]:
-        """Apply every {from,to} mapping; returns (text, replacement count)."""
-        count = 0
+    def _apply_retargets(text: str, replaces: list) -> tuple[str, dict]:
+        """Apply every {from,to} mapping SIMULTANEOUSLY in one pass;
+        returns (text, {from: count}).
+
+        Simultaneity is load-bearing: the month roll is a chained rename —
+        e.g. June's header L2 is 'AR_05.31'!V4 - 'AR_06.30'!L3 and July's
+        correct L2 is 'AR_06.30'!V4 - 'AR_07.31'!L3, i.e. BOTH
+        AR_05.31→AR_06.30 and AR_06.30→AR_07.31 in the same cell. Applying
+        the mappings sequentially would cascade the first replacement into
+        the second (May→June→July) and every ref would land on the final
+        name."""
+        pat_map: dict[str, tuple[str, str]] = {}
+        counts = {m["from"]: 0 for m in replaces}
         for m in replaces:
             frm, to = m["from"], m["to"]
-            for pat, rep in ((f"'{frm}'", f"'{to}'"), (f"{frm}!", f"{to}!")):
-                n = text.count(pat)
-                if n:
-                    text = text.replace(pat, rep)
-                    count += n
-        return text, count
+            pat_map[f"'{frm}'"] = (f"'{to}'", frm)
+            pat_map[f"{frm}!"] = (f"{to}!", frm)
+        rx = re.compile("|".join(
+            re.escape(p) for p in sorted(pat_map, key=len, reverse=True)))
+
+        def sub(mm):
+            rep, frm = pat_map[mm.group(0)]
+            counts[frm] += 1
+            return rep
+
+        return rx.sub(sub, text), counts
+
+    def _note_retargets(self, sheet: str, counts: dict) -> None:
+        agg = self._retarget_counts.setdefault(sheet, {})
+        for frm, n in counts.items():
+            agg[frm] = agg.get(frm, 0) + n
 
     def paste_columns(self, sheet: str, anchor: str, rows: list,
                       clear_beyond: bool = True):
@@ -288,18 +308,20 @@ class XlsxSurgeon:
                     xml = self._strip_rid_tags(xml)
                     _mem_log(f"after stripping relationship tags on {source!r}")
                     self._assert_no_dangling_rids(f"duplicate of {source!r}", xml, ())
-                    # ONE merged pass for any queued paste/set ops — see _apply_row_ops.
+                    # retarget the INHERITED copy first, THEN write new data:
+                    # generated formulas already carry the resolved prior tab
+                    # and must not be shifted by a chained-rename mapping
                     changed = 1                     # the new sheet itself
+                    if retargets:
+                        xml, rc = self._apply_retargets(xml, retargets)
+                        self._note_retargets(new_name, rc)
+                        changed += sum(rc.values())
+                    # ONE merged pass for any queued paste/set ops — see _apply_row_ops.
                     if paste_groups or cell_groups:
                         _mem_log(f"before paste/set_cells on duplicated {new_name!r}")
                         xml, n = self._apply_row_ops(xml, paste_groups, cell_groups)
                         changed += n
                         _mem_log(f"after paste/set_cells on duplicated {new_name!r}")
-                    if retargets:
-                        xml, n = self._apply_retargets(xml, retargets)
-                        self._retarget_counts[new_name] = (
-                            self._retarget_counts.get(new_name, 0) + n)
-                        changed += n
                     results.append({"target": new_name, "kind": "duplicate_sheet",
                                     "sourcePartMB": round(src_size / 1048576, 1),
                                     "cellsChanged": changed})
@@ -425,20 +447,23 @@ class XlsxSurgeon:
                 self._assert_no_dangling_rids(part, xml, ())
                 zout.writestr(part, xml)
 
-        # every supplied retarget mapping must have actually hit something —
+        # EVERY supplied retarget mapping must have actually hit something —
         # a silent no-op here is exactly how a stale prior-month reference
         # shipped into a delivered workbook
         for kind, target, payload in self._ops:
             if kind == "retarget":
-                n = self._retarget_counts.get(target, 0)
-                if n == 0:
-                    raise ValueError(
-                        f"retarget_refs on {target!r} made 0 replacements for "
-                        f"{payload} — refusing: either the mapping is wrong or "
-                        "the stale references it was meant to fix don't exist")
-        for sheet, n in self._retarget_counts.items():
+                sheet_counts = self._retarget_counts.get(target, {})
+                for m in payload:
+                    if sheet_counts.get(m["from"], 0) == 0:
+                        raise ValueError(
+                            f"retarget_refs on {target!r}: mapping "
+                            f"{m['from']}->{m['to']} made 0 replacements — "
+                            "refusing: either the mapping is wrong or the "
+                            "stale references it was meant to fix don't exist")
+        for sheet, per_from in self._retarget_counts.items():
             results.append({"target": sheet, "kind": "retarget_refs",
-                            "replacements": n, "cellsChanged": 0})
+                            "replacements": sum(per_from.values()),
+                            "perMapping": dict(per_from), "cellsChanged": 0})
 
         if sum(r["cellsChanged"] for r in results) == 0 \
                 and not self._retarget_counts:
@@ -604,12 +629,15 @@ class XlsxSurgeon:
             self._assert_no_dangling_rids(f"{label} (suffix)", suffix, ())
         rkey = retarget_key or label
         if retargets:
-            # header rows / suffix carry the source's formulas verbatim, and
-            # generated cell values might too if a caller passes stale refs
-            prefix, n1 = self._apply_retargets(prefix, retargets)
-            suffix, n2 = self._apply_retargets(suffix, retargets)
-            self._retarget_counts[rkey] = (
-                self._retarget_counts.get(rkey, 0) + n1 + n2)
+            # INHERITED content only (header rows in the prefix, suffix).
+            # Generated rows are deliberately excluded: their formulas come
+            # from the caller's ops with the prior tab already resolved
+            # (e.g. AR_06.30), and a chained-rename mapping like
+            # AR_06.30→AR_07.31 must not shift them onto themselves.
+            prefix, c1 = self._apply_retargets(prefix, retargets)
+            suffix, c2 = self._apply_retargets(suffix, retargets)
+            self._note_retargets(rkey, c1)
+            self._note_retargets(rkey, c2)
 
         # ---- write: prefix + generated rows (batched) + suffix
         changed = 0
@@ -619,14 +647,6 @@ class XlsxSurgeon:
             for rn in sorted(row_vals):
                 d = row_vals[rn]
                 values = [d.get(c) for c in range(1, max_col + 1)]
-                if retargets:
-                    for i, v in enumerate(values):
-                        if isinstance(v, str) and v.startswith("="):
-                            v2, n = self._apply_retargets(v, retargets)
-                            if n:
-                                values[i] = v2
-                                self._retarget_counts[rkey] = (
-                                    self._retarget_counts.get(rkey, 0) + n)
                 batch.append(row_xml(rn, values))
                 changed += len(d)
                 if len(batch) >= 512:
@@ -700,15 +720,15 @@ class XlsxSurgeon:
             # full pass per op — see _apply_row_ops. On a real month's file
             # this is the difference between two full in-memory copies of
             # 'New Sales report' and four.
+            # retarget the sheet's EXISTING content first, then write new
+            # data on top — same inherited-only semantics as the dup paths
+            if retarget_groups:
+                xml, rc = self._apply_retargets(xml, retarget_groups)
+                self._note_retargets(retarget_key or os.path.basename(src), rc)
+                changed += sum(rc.values())
             if paste_groups or set_cells:
                 xml, n = self._apply_row_ops(
                     xml, paste_groups or [], [set_cells] if set_cells else [])
-                changed += n
-            if retarget_groups:
-                xml, n = self._apply_retargets(xml, retarget_groups)
-                key = retarget_key or os.path.basename(src)
-                self._retarget_counts[key] = (
-                    self._retarget_counts.get(key, 0) + n)
                 changed += n
             if append_groups:
                 xml, n = self._apply_append_inmem(xml, append_groups)

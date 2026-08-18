@@ -380,14 +380,17 @@ def fetch_customers(mcp: Mcp, ids: list[str]) -> dict[str, dict]:
     2026-08-18 against five customers whose saved-search "Commission Pct"
     values were known (Johnson's 10, American Man 20, Cavenders#34 5,
     Cattleman 14, Walker 7). BUILTIN.DF gives the label; the raw column is
-    the option's internal id (1..6) and must NOT be used directly. Stored
-    here as a fraction (10 -> 0.10) to match the workbook's rate convention
-    (the AA fallback is 0.1, the Y column emits 0.05/0.09/...)."""
+    the option's internal id (1..6) and must NOT be used directly.
+
+    Kept as the label TEXT ("10", not 0.10): the workbook has always stored
+    Q as text whole numbers — the AGA saved-search CSV export shows literal
+    "5"/"10"/"20"/"7" — and downstream consumers expect that. (An earlier
+    revision converted to fractions; that conversion was OURS, not
+    NetSuite's, and it was wrong to add.) Nothing in the Y:AH formula block
+    references Q, so text is safe."""
     def pct(label):
-        try:
-            return float(label) / 100.0 if label not in (None, "") else None
-        except (TypeError, ValueError):
-            return None
+        s = str(label).strip() if label not in (None, "") else ""
+        return s or None
 
     out: dict[str, dict] = {}
     for batch in chunks(ids, CUST_BATCH):

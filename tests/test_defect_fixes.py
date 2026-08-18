@@ -29,7 +29,7 @@ raw_row = {"c01": "875001 Store", "c02": "7/15/2026", "c03": "Invoice",
 cust = {"22373": {"type": "Wholesale", "category": "Romane",
                   "first_sale": nx.serial("2/9/2006"), "store_type": "Western",
                   "company": "Johnson's Men's Wear", "partner": "Tiffany McDaniel",
-                  "commission_pct": 0.10}}
+                  "commission_pct": "10"}}
 items = {"95302": "Tru Western - Yellowstone"}
 states = {"29506822": "TX"}
 partners = {"Tiffany McDaniel": "Primary Rep"}
@@ -40,7 +40,7 @@ ar_rows, _ = nx.build_ar_rows([dict(raw_row)], cust, items, states, partners,
                               accounts, sign_flip=True)
 r = ar_rows[0]
 check("AR1: 24 values", len(r) == 24, len(r))
-check("AR2: Q = commission pct fraction", r[16] == 0.10, r[16])
+check("AR2: Q = commission pct label TEXT", r[16] == "10", repr(r[16]))
 check("AR3: W = dashed AR account", r[22] == "11300 - Accounts Receivable - Trade", r[22])
 check("AR4: P = partner role (unchanged)", r[15] == "Primary Rep", r[15])
 check("AR5: sign flip still applied", r[10] == 4.0 and r[11] == 100.5, (r[10], r[11]))
@@ -50,7 +50,7 @@ sales_rows, _ = nx.build_sales_rows([dict(raw_row)], cust, items, states,
 s = sales_rows[0]
 check("S1: 25 values", len(s) == 25, len(s))
 check("S2: P = customer's partner (person)", s[15] == "Tiffany McDaniel", s[15])
-check("S3: Q = commission pct fraction", s[16] == 0.10, s[16])
+check("S3: Q = commission pct label TEXT", s[16] == "10", repr(s[16]))
 check("S4: U unchanged (customer's partner)", s[20] == "Tiffany McDaniel", s[20])
 check("S5: W = month label of row date", s[22] == "Jul 2026", s[22])
 age = s[23]
@@ -86,11 +86,13 @@ WB_RELS = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
            '</Relationships>')
-# June-style sheet: header formula in row 4, data rows 7-8 with prior-month
-# (May) XLOOKUPs exactly like the delivered file showed
+# June-style sheet: L2 is the load-bearing header formula the delivered file
+# showed surviving ('AR_05.31'!V4 - 'AR_06.30'!L3 — prior-month total minus
+# own L3). Data rows 7-8 carry May XLOOKUPs.
 AR = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
      '<dimension ref="A1:AH9"/><sheetData>'
+     '<row r="2"><c r="L2"><f>\'AR_05.31\'!V4-\'AR_06.30\'!L3</f><v>19562.35</v></c></row>'
      '<row r="4"><c r="AD4"><f>\'AR_05.31\'!$B$1+0</f></c></row>'
      '<row r="6"><c r="A6" t="inlineStr"><is><t>Client</t></is></c></row>'
      '<row r="7"><c r="A7" t="inlineStr"><is><t>old</t></is></c>'
@@ -118,20 +120,33 @@ def sheet_of(path, name):
         return z.read("xl/" + tgt).decode()
 
 
-# R1: dup + paste + set + retarget (streaming path) — quoted AND unquoted fixed
+# R1: dup + paste + set + TWO-WAY retarget (streaming path). The month
+# roll: May->June AND June->July, simultaneously. Generated data rows
+# reference AR_06.30 (as the templates emit) and must NOT be shifted.
+TWO_WAY = [{"from": "AR_05.31", "to": "AR_06.30"},
+           {"from": "AR_06.30", "to": "AR_07.31"}]
 out1 = os.path.join(WORK, "out1.xlsx")
 sg = XlsxSurgeon(src, workdir=WORK)
 sg.duplicate_sheet("AR_06.30", "AR_07.31")
 sg.paste_columns("AR_07.31", "A7", [["july1"] + [None] * 23,
                                     ["july2"] + [None] * 23], True)
-sg.set_cells("AR_07.31", {"Z7": "=V7-L7", "Z8": "=V8-L8"})
-sg.retarget_refs("AR_07.31", [{"from": "AR_05.31", "to": "AR_06.30"}])
+sg.set_cells("AR_07.31", {
+    "AD7": "=_xlfn.XLOOKUP(AC7,'AR_06.30'!AG:AG,'AR_06.30'!L:L)",
+    "AD8": "=_xlfn.XLOOKUP(AC8,'AR_06.30'!AG:AG,'AR_06.30'!L:L)"})
+sg.retarget_refs("AR_07.31", TWO_WAY)
 res = sg.apply(out1)
 dup = sheet_of(out1, "AR_07.31")
-check("R1: no AR_05.31 left in dup", "AR_05.31" not in dup, dup)
-check("R2: header formula row 4 retargeted (prefix)", "'AR_06.30'!$B$1" in dup, dup[:400])
+check("R1: no AR_05.31 left anywhere in dup (incl. rows 1-6)",
+      "AR_05.31" not in dup, dup[:500])
+check("R2: L2 two-way shifted correctly (no cascade)",
+      "'AR_06.30'!V4-'AR_07.31'!L3" in dup, dup[:500])
+check("R2b: header AD4 shifted May->June", "'AR_06.30'!$B$1" in dup)
+check("R2c: generated data formulas NOT shifted (still prior-month June)",
+      "_xlfn.XLOOKUP(AC7,'AR_06.30'!AG:AG" in dup.replace("&apos;", "'"), dup[-900:])
 rt = [r0 for r0 in res if r0["kind"] == "retarget_refs"]
-check("R3: replacements reported", rt and rt[0]["replacements"] >= 1, res)
+check("R3: per-mapping counts reported",
+      rt and rt[0]["perMapping"].get("AR_05.31", 0) >= 1
+      and rt[0]["perMapping"].get("AR_06.30", 0) >= 1, rt)
 check("R4: source sheet untouched", "AR_05.31" in sheet_of(out1, "AR_06.30"))
 
 # R5: retarget on EXISTING sheet (in-memory path, no paste)
@@ -143,17 +158,20 @@ ex = sheet_of(out2, "AR_06.30")
 check("R5: existing-sheet retarget applied", "AR_05.31" not in ex and "'AR_04.30'!AG:AG" in ex)
 check("R6: unquoted form also fixed", "AR_04.30!AG:AG" in ex, ex[-500:])
 rt2 = [r0 for r0 in res2 if r0["kind"] == "retarget_refs"]
-check("R7: count = 5 (3 quoted + 2 unquoted)",
-      rt2 and rt2[0]["replacements"] == 5, rt2)
+check("R7: count = 6 (L2 + AD4 + AD7x2 quoted, AG7x2 unquoted)",
+      rt2 and rt2[0]["replacements"] == 6, rt2)
 
-# R8: zero-replacement mapping FAILS the job
+# R8: any mapping with zero replacements FAILS the job — even when the
+# other mapping in the same op hits
 sg = XlsxSurgeon(src, workdir=WORK)
-sg.retarget_refs("AR_06.30", [{"from": "AR_01.31", "to": "AR_02.28"}])
+sg.retarget_refs("AR_06.30", [{"from": "AR_05.31", "to": "AR_04.30"},
+                              {"from": "AR_01.31", "to": "AR_02.28"}])
 try:
     sg.apply(os.path.join(WORK, "out3.xlsx"))
-    check("R8: zero-count retarget raises", False)
+    check("R8: zero-count mapping raises", False)
 except ValueError as e:
-    check("R8: zero-count retarget raises", "0 replacements" in str(e), str(e))
+    check("R8: zero-count mapping raises",
+          "AR_01.31" in str(e) and "0 replacements" in str(e), str(e))
 
 print()
 print("RESULT:", "ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}")
