@@ -372,7 +372,7 @@ def _run(job_id: str, job: Job):
                 pass
 
 
-VERSION = "2026-08-17-extract-v9-diag"
+VERSION = "2026-08-18-extract-v10-streamdup"
 
 
 @app.get("/health")
