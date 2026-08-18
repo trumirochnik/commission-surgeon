@@ -19,6 +19,7 @@ Operations:
   add_sheet(name, rows)                           # new worksheet at the end
 """
 
+import codecs
 import os
 import re
 import shutil
@@ -215,38 +216,55 @@ class XlsxSurgeon:
                     src_part = self._sheet_parts[source]
                     src_size = zf.getinfo(src_part).file_size
                     print(f"[mem] duplicate_sheet {source!r}: source part is "
-                         f"{round(src_size / 1048576, 1)} MB compressed", flush=True)
+                         f"{round(src_size / 1048576, 1)} MB decompressed", flush=True)
+                    pend = [o for o in self._ops if o[1] == new_name and o[0] in ("paste", "set")]
+                    paste_groups = [p[2] for p in pend if p[0] == "paste"]
+                    cell_groups = [p[2][0] for p in pend if p[0] == "set"]
+
+                    # Streaming rebuild is only equivalent when the ops
+                    # regenerate the data region TOTALLY: every paste clears
+                    # beyond its block, and every formula cell lands inside
+                    # the pasted row range (so no source content in the
+                    # generated region is meant to survive).
+                    paste_rows_span = [(split_ref(a)[1], split_ref(a)[1] + len(r) - 1)
+                                       for a, r, _c in paste_groups]
+                    cell_rows = {split_ref(ref)[1]
+                                 for cells in cell_groups for ref in cells}
+                    use_stream = (
+                        bool(paste_groups)
+                        and all(c for _a, _r, c in paste_groups)
+                        and all(any(lo <= rn <= hi for lo, hi in paste_rows_span)
+                                for rn in cell_rows))
+
+                    if use_stream:
+                        _mem_log(f"before streaming rebuild of {source!r}")
+                        tmp = os.path.join(self.workdir,
+                                           f"dup_{len(new_sheets)}.xml")
+                        changed = 1 + self._dup_stream_rebuild(
+                            zf, src_part, tmp, paste_groups, cell_groups, source)
+                        _mem_log(f"after streaming rebuild of {source!r}")
+                        results.append({"target": new_name,
+                                        "kind": "duplicate_sheet",
+                                        "sourcePartMB": round(src_size / 1048576, 1),
+                                        "streamed": True,
+                                        "cellsChanged": changed})
+                        new_sheets.append((new_name, ("__FILE__", tmp)))
+                        continue
+
+                    # in-memory fallback: dup-only, or ops that must preserve
+                    # source content inside the data region
                     _mem_log(f"before reading {source!r}")
                     xml = zf.read(src_part).decode("utf-8")
-                    print(f"[mem] duplicate_sheet {source!r}: decoded to "
-                         f"{round(len(xml) / 1_000_000, 1)} MB of text", flush=True)
                     _mem_log(f"after decoding {source!r}")
                     # The copy gets NO _rels part, so ANY surviving r:id is a hard
                     # OPC violation — Excel repairs the file and drops the sheet.
                     # pageSetup carries an r:id whenever the sheet ever had a
                     # print area; hyperlinks/pictures/controls likewise.
-                    # Combined into 3 passes (was 20 separate re.sub calls, each
-                    # a full-string copy of a real sheet that can be tens of MB)
-                    # — a straightforward win regardless of what else is resident.
-                    xml = re.sub(
-                        r"<(?P<tag>drawing|legacyDrawing|tableParts|pageSetup|"
-                        r"hyperlink|picture|oleObject|control)\b[^>]*>.*?</(?P=tag)>",
-                        "", xml, flags=re.S)
-                    xml = re.sub(
-                        r"<(?:drawing|legacyDrawing|tableParts|pageSetup|"
-                        r"hyperlink|picture|oleObject|control)\b[^>]*/>", "", xml)
-                    xml = re.sub(
-                        r"<(?P<wrap>hyperlinks|oleObjects|controls)\s*>\s*</(?P=wrap)>"
-                        r"|<(?:hyperlinks|oleObjects|controls)\s*/>", "", xml)
+                    xml = self._strip_rid_tags(xml)
                     _mem_log(f"after stripping relationship tags on {source!r}")
                     self._assert_no_dangling_rids(f"duplicate of {source!r}", xml, ())
-                    # duplicated sheet may still need pastes applied to it later:
-                    # apply queued paste/set ops that target the NEW name in-memory now.
-                    # ONE merged pass, not one per op — see _apply_row_ops.
+                    # ONE merged pass for any queued paste/set ops — see _apply_row_ops.
                     changed = 1                     # the new sheet itself
-                    pend = [o for o in self._ops if o[1] == new_name and o[0] in ("paste", "set")]
-                    paste_groups = [p[2] for p in pend if p[0] == "paste"]
-                    cell_groups = [p[2][0] for p in pend if p[0] == "set"]
                     if paste_groups or cell_groups:
                         _mem_log(f"before paste/set_cells on duplicated {new_name!r}")
                         xml, n = self._apply_row_ops(xml, paste_groups, cell_groups)
@@ -286,6 +304,8 @@ class XlsxSurgeon:
                     f'openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
                 if rows == "__RAW__":
                     new_parts.append((part, styles))     # styles holds raw xml here
+                elif rows == "__FILE__":
+                    new_parts.append((part, ("__FILE__", styles)))  # styles holds a path
                 else:
                     results.append({"target": name, "kind": "add_sheet",
                                     "cellsChanged": max(
@@ -358,6 +378,17 @@ class XlsxSurgeon:
                         with zout.open(zi, "w", force_zip64=True) as w:
                             shutil.copyfileobj(f, w, CHUNK)
             for part, xml in new_parts:
+                if isinstance(xml, tuple) and xml[0] == "__FILE__":
+                    # streamed rebuild: prefix/suffix were rid-checked at
+                    # build time and the generated rows can't carry r:id
+                    path = xml[1]
+                    zi = zipfile.ZipInfo(part)
+                    zi.compress_type = zipfile.ZIP_DEFLATED
+                    with open(path, "rb") as f, \
+                         zout.open(zi, "w", force_zip64=True) as w:
+                        shutil.copyfileobj(f, w, CHUNK)
+                    os.remove(path)
+                    continue
                 # authored in memory with no _rels part: r:ids must be gone
                 self._assert_no_dangling_rids(part, xml, ())
                 zout.writestr(part, xml)
@@ -366,6 +397,162 @@ class XlsxSurgeon:
             raise ValueError(
                 "no op changed anything — refusing to upload an unmodified file")
         return results
+
+    _RID_STRIP_PAIRED = re.compile(
+        r"<(?P<tag>drawing|legacyDrawing|tableParts|pageSetup|"
+        r"hyperlink|picture|oleObject|control)\b[^>]*>.*?</(?P=tag)>", re.S)
+    _RID_STRIP_SELFCLOSED = re.compile(
+        r"<(?:drawing|legacyDrawing|tableParts|pageSetup|"
+        r"hyperlink|picture|oleObject|control)\b[^>]*/>")
+    _RID_STRIP_EMPTYWRAP = re.compile(
+        r"<(?P<wrap>hyperlinks|oleObjects|controls)\s*>\s*</(?P=wrap)>"
+        r"|<(?:hyperlinks|oleObjects|controls)\s*/>")
+
+    def _strip_rid_tags(self, xml: str) -> str:
+        xml = self._RID_STRIP_PAIRED.sub("", xml)
+        xml = self._RID_STRIP_SELFCLOSED.sub("", xml)
+        return self._RID_STRIP_EMPTYWRAP.sub("", xml)
+
+    def _dup_stream_rebuild(self, zf, src_part: str, dst_path: str,
+                            paste_groups: list, cell_groups: list,
+                            source: str) -> int:
+        """Duplicate-with-pastes without ever holding the source sheet (or
+        the result) in memory.
+
+        The measured reality that forced this: the real AR_06.30 part is
+        33.8MB of XML text. Reading + decoding it took RSS from 186MB to
+        267MB, the tag-stripping regexes to 299MB, and the in-memory
+        paste/formula merge then blew past the 512MB container limit — with
+        a ~186MB baseline of extracted-row ops there is no in-memory
+        transform of a sheet this size that fits. So: stream the source
+        part, keep only the PREFIX (everything before the first generated
+        row — XML prolog, cols, header rows) and the SUFFIX (</sheetData>
+        onward) verbatim minus relationship-bearing tags, and generate the
+        entire data region straight to disk from the queued ops. Same
+        bounded-memory architecture the append path already uses on the
+        464,908-row 'Sales report Raw'.
+
+        SEMANTIC DELTA vs the in-memory path, both deliberate:
+          * source rows at/past the first generated row that the ops do not
+            regenerate are DROPPED, not kept-with-cleared-columns. Kept June
+            rows past July's extent would carry stale Y:AH formulas into
+            SUM ranges; the ops emit every data AND formula column for
+            every row, so regeneration is total.
+          * source cell content in the generated range OUTSIDE the pasted
+            columns is dropped too — the callers' set_cells ops rewrite the
+            full formula span, which is exactly why total regeneration is
+            sound for this workbook (probe confirmed AI+ columns are empty).
+        Callers must gate on clear_beyond=True for every paste group.
+        """
+        # ---- merge every op into one {row: {col_index: value}} plan
+        row_vals: dict[int, dict[int, object]] = {}
+        for anchor, rows, _clear in paste_groups:
+            a_col, a_row = split_ref(anchor)
+            start = col_index(a_col)
+            for i, values in enumerate(rows):
+                d = row_vals.setdefault(a_row + i, {})
+                for jx, v in enumerate(values):
+                    d[start + jx] = v
+        for cells in cell_groups:
+            for ref, val in cells.items():
+                col, rn = split_ref(ref)
+                row_vals.setdefault(rn, {})[col_index(col)] = val
+        if not row_vals:
+            raise ValueError("streaming duplicate rebuild called with no rows")
+        first_gen = min(row_vals)
+        last_gen = max(row_vals)
+        max_col = max(max(d) for d in row_vals.values())
+
+        # ---- stream the source part: capture prefix and suffix, skip the middle
+        CLOSE = "</sheetData>"
+        row_open_re = re.compile(r'<row r="(\d+)"')
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        prefix = None
+        suffix_chunks: list[str] = []
+        stage = 0            # 0=collect prefix, 1=skip to </sheetData>, 2=collect suffix
+        buf = ""
+        with zf.open(src_part) as f:
+            eof = False
+            while not eof:
+                b = f.read(CHUNK)
+                eof = not b
+                text = dec.decode(b, final=eof)
+
+                if stage == 0:
+                    # prefix region is small (prolog + cols + header rows);
+                    # buf legitimately accumulates until the split point
+                    buf += text
+                    cut = None
+                    for m in row_open_re.finditer(buf):
+                        if int(m.group(1)) >= first_gen:
+                            cut = m.start()
+                            break
+                    if cut is not None:
+                        prefix, text, stage = buf[:cut], buf[cut:], 1
+                        buf = ""
+                    else:
+                        m_sc = re.search(r"<sheetData\s*/>", buf)
+                        ci = buf.find(CLOSE)
+                        if m_sc and (ci == -1 or m_sc.start() < ci):
+                            prefix = buf[:m_sc.start()] + "<sheetData>"
+                            suffix_chunks.append(CLOSE + buf[m_sc.end():])
+                            buf, stage = "", 2
+                            continue
+                        if ci != -1:
+                            prefix = buf[:ci]
+                            suffix_chunks.append(buf[ci:])
+                            buf, stage = "", 2
+                            continue
+                        if eof:
+                            raise ValueError(
+                                f"{src_part}: sheetData not found while streaming")
+                        continue   # still collecting prefix
+
+                if stage == 1:
+                    # discard rows we regenerate; only watch for </sheetData>,
+                    # keeping a marker-sized carry across chunk boundaries
+                    window = buf + text
+                    idx = window.find(CLOSE)
+                    if idx == -1:
+                        buf = window[-(len(CLOSE) - 1):]
+                        if eof:
+                            raise ValueError(
+                                f"{src_part}: </sheetData> never found")
+                        continue
+                    suffix_chunks.append(window[idx:])
+                    buf, stage = "", 2
+                    continue
+
+                if stage == 2 and text:
+                    suffix_chunks.append(text)
+        if prefix is None:
+            raise ValueError(f"{src_part}: sheetData not found while streaming")
+
+        # ---- strip relationship-bearing tags; the copy has no _rels part
+        prefix = self._strip_rid_tags(prefix)
+        suffix = self._strip_rid_tags("".join(suffix_chunks))
+        prefix = re.sub(r'<dimension ref="[^"]*"',
+                        f'<dimension ref="A1:{col_letter(max_col)}{last_gen}"',
+                        prefix, count=1)
+        self._assert_no_dangling_rids(f"duplicate of {source!r} (prefix)", prefix, ())
+        self._assert_no_dangling_rids(f"duplicate of {source!r} (suffix)", suffix, ())
+
+        # ---- write: prefix + generated rows (batched) + suffix
+        changed = 0
+        with open(dst_path, "w", encoding="utf-8") as out:
+            out.write(prefix)
+            batch: list[str] = []
+            for rn in sorted(row_vals):
+                d = row_vals[rn]
+                values = [d.get(c) for c in range(1, max_col + 1)]
+                batch.append(row_xml(rn, values))
+                changed += len(d)
+                if len(batch) >= 512:
+                    out.write("".join(batch))
+                    batch.clear()
+            out.write("".join(batch))
+            out.write(suffix)
+        return changed
 
     @staticmethod
     def _assert_no_dangling_rids(part_name: str, xml: str, rel_ids) -> None:

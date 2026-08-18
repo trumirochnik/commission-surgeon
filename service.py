@@ -310,7 +310,15 @@ def _run(job_id: str, job: Job):
             _mem_checkpoint(j, "before_apply_phase1")
             results1 = s1.apply(mid)
             _mem_checkpoint(j, "after_apply_phase1")
-            del s1   # ensure phase 1's surgeon/ops are out of scope before phase 2
+            # ensure phase 1's surgeon, its queued ops, AND the AR paste
+            # rows/formula dicts (the bulk of the ~186MB pre-surgery
+            # baseline) are all collectible before phase 2 begins
+            del s1
+            phase1_ops = None
+            job.ops = []
+            import gc
+            gc.collect()
+            _mem_checkpoint(j, "after_phase1_release")
             s2 = XlsxSurgeon(mid, workdir=WORK)   # fresh read from the intermediate
             _run_ops(s2, phase2_ops)
             _mem_checkpoint(j, "before_apply_phase2")
