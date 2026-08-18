@@ -215,6 +215,17 @@ class XlsxSurgeon:
                 out[(rn - r_lo, ci - c_lo)] = _xr.cell_value(cell, {})
         return out
 
+    def pivot_refresh_on_load(self):
+        """Stamp refreshOnLoad="1" on every pivotCacheDefinition part, so the
+        three genuine PivotTables (Statement/Summary/sales-history) refresh
+        themselves the first time the file opens in desktop Excel — the only
+        environment that can open a ~115MB workbook. Graph cannot refresh
+        pivots and Excel Online refuses the file, so open-time refresh is
+        the one automatable path. Source refs are left EXACTLY as-is (the
+        hand-built caches already carry oversized ranges; a manual refresh
+        reads the same ranges, so this replicates existing behavior)."""
+        self._ops.append(("pivotreload", None, None))
+
     def retarget_refs(self, sheet: str, replace: list):
         """Rewrite cross-sheet references in one sheet's formulas, e.g.
         [{"from": "AR_05.31", "to": "AR_06.30"}]. Matches both the quoted
@@ -285,7 +296,10 @@ class XlsxSurgeon:
         per_part: dict[str, dict] = {}
         new_sheets = []
         dup_sheets = []
+        pivot_reload = any(k == "pivotreload" for k, _t, _p in self._ops)
         for kind, target, payload in self._ops:
+            if kind == "pivotreload":
+                continue
             if kind == "add":
                 new_sheets.append((target, payload))
                 continue
@@ -480,6 +494,23 @@ class XlsxSurgeon:
                         with zout.open(zi, "w", force_zip64=True) as w:
                             shutil.copyfileobj(f, w, CHUNK)
                     os.remove(tmp_in), os.remove(tmp_out)
+                elif pivot_reload and re.match(
+                        r"xl/pivotCache/pivotCacheDefinition\d+\.xml$", name):
+                    px = zin.read(name).decode("utf-8", "replace")
+                    if 'refreshOnLoad="1"' not in px:
+                        if "refreshOnLoad=" in px:
+                            px2 = re.sub(r'refreshOnLoad="[^"]*"',
+                                         'refreshOnLoad="1"', px, count=1)
+                        else:
+                            px2 = px.replace("<pivotCacheDefinition ",
+                                             '<pivotCacheDefinition refreshOnLoad="1" ', 1)
+                        if px2 != px:
+                            results.append({"op": "pivot_refresh_on_load",
+                                            "sheet": name, "target": name,
+                                            "kind": "pivot_refresh_on_load",
+                                            "cellsChanged": 1})
+                        px = px2
+                    zout.writestr(name, px)
                 else:
                     # untouched: stream through
                     zi = zipfile.ZipInfo(name)

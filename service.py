@@ -844,7 +844,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-20-v20-discovery2"
+VERSION = "2026-08-20-v21-pivotreload"
 
 
 @app.get("/health")
