@@ -343,6 +343,14 @@ _DISCOVERY_ROWS = [
     {"sheet": "REC", "rows": "1:10"},
     {"sheet": "Sales report", "rows": "1:6"},
     {"sheet": "Kevin Hanks_Sales", "rows": "1:6"},
+    # current-month AR block inside Data (starts ~11+prior rows) and the
+    # new-sales block start — the SOP's formulas-not-values exception rows
+    {"sheet": "Data", "rows": "16368:16380"},
+    {"sheet": "Data", "rows": "32720:32740"},
+    # AR header-area parameter cells the rate formulas anchor to
+    # ($AD$1, $AE$1, $AI$1, $AD$4)
+    {"sheet": "AR_06.30", "rows": "1:6"},
+    {"sheet": "Commission Rate by SKUs", "rows": "1:8"},
 ]
 
 
@@ -429,7 +437,11 @@ def _run_inspect(src: str, spec: dict) -> dict:
             m = re.match(r"^(\d+):(\d+)$", str(rs["rows"]))
             lo, hi = (int(m.group(1)), int(m.group(2))) if m else (1, 8)
             rows = xr.stream_rows(zf, part, lo, hi)
-            fetched.append((sheet, rows))
+            merged = next((f for f in fetched if f[0] == sheet), None)
+            if merged:
+                merged[1].update(rows)
+            else:
+                fetched.append((sheet, rows))
             for rc in rows.values():
                 need |= xr.shared_indices(rc.values())
         shared = xr.resolve_shared(zf, need)
@@ -736,6 +748,8 @@ def _run(job_id: str, job: Job):
                     surgeon.retarget_refs(op["sheet"], op["replace"])
                 elif kind == "copy_range_values":
                     surgeon.copy_range_values(op["sheet"], op["from"], op["to"])
+                elif kind == "pivot_refresh_on_load":
+                    surgeon.pivot_refresh_on_load()
                 else:
                     raise ValueError(f"unknown op {kind!r}")
 
@@ -830,7 +844,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-20-v19-rollop"
+VERSION = "2026-08-20-v20-discovery2"
 
 
 @app.get("/health")
