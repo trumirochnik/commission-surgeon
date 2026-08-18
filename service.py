@@ -115,7 +115,13 @@ PROBE_SCAN_CAP = 64 * 1024 * 1024   # stop scanning a sheet part for the probe r
 # JOBS used to be memory-only: a Render redeploy/restart/crash mid-job made
 # GET /jobs/{id} 404 ("unknown job") and the n8n poll loop errored out even
 # when the job had actually finished. State now round-trips through a JSON
-# file in /tmp — survives a restart of the same instance/deploy cycle.
+# file in /tmp — SURVIVES in-place process restarts (crash/OOM recovery
+# reuses the same container: instance tags in Render logs persist across
+# "Instance failed"/"Service recovered" cycles) but NOT redeploys, which
+# swap in a fresh container and filesystem (verified live 2026-08-19: a
+# redeploy mid-job 404'd the poll). Full redeploy survival would need
+# Render's Persistent Disk or external state; crash recovery is the
+# failure mode this service has actually hit.
 # NOTE: this design (and the polling model) assumes WEB_CONCURRENCY=1.
 # Multiple workers would each hold their own JOBS view and polls would land
 # on the wrong process — if worker count ever needs raising, job state must
@@ -523,7 +529,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-19-extract-v16-robustness"
+VERSION = "2026-08-19-extract-v17-jobstate"
 
 
 @app.get("/health")
@@ -545,7 +551,11 @@ def create_job(job: Job):
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
     if job_id not in JOBS:
-        raise HTTPException(404, "unknown job")
+        raise HTTPException(
+            404, "unknown job — either it never existed, it aged out "
+                 "(>7 days), or its state was lost to a REDEPLOY (a deploy "
+                 "replaces the container and /tmp with it; only in-place "
+                 "crash/OOM restarts preserve job state). Re-run the job.")
     return JOBS[job_id]
 
 
