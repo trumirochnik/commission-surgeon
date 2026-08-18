@@ -329,14 +329,20 @@ def _run_read_ranges(path: str, specs: list[dict], j: dict) -> None:
 
 
 _DISCOVERY_ROWS = [
-    {"sheet": "Data", "rows": "1:8"},
-    {"sheet": "Compiled Data", "rows": "1:10"},
+    {"sheet": "Data", "rows": "1:12"},          # 1:12 reaches the data-area
+    {"sheet": "Compiled Data", "rows": "1:10"},  # header (~row 9-10) + row 11
     {"sheet": "Payment", "rows": "1:40"},
     {"sheet": "Dashboard", "rows": "1:40"},
     {"sheet": "Info", "rows": "1:40"},
     {"sheet": "Kevin Hanks", "rows": "1:30"},
     {"sheet": "Tiffany M.", "rows": "1:30"},
     {"sheet": "Partial Payments", "rows": "1:12"},
+    {"sheet": "Summary Pivot", "rows": "1:12"},
+    {"sheet": "Statement Pivot", "rows": "1:8"},
+    {"sheet": "Journal_Template", "rows": "1:20"},
+    {"sheet": "REC", "rows": "1:10"},
+    {"sheet": "Sales report", "rows": "1:6"},
+    {"sheet": "Kevin Hanks_Sales", "rows": "1:6"},
 ]
 
 
