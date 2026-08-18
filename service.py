@@ -444,7 +444,7 @@ def _run(job_id: str, job: Job):
                 pass
 
 
-VERSION = "2026-08-18-extract-v13-uploadrecovery"
+VERSION = "2026-08-18-extract-v14-datafix"
 
 
 @app.get("/health")
