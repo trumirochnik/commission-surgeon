@@ -37,16 +37,20 @@ Job request body:
     {"op": "duplicate_sheet", "source": "AR_06.30", "name": "AR_07.31"},
     {"op": "set_cells",   "sheet": "Dashboard", "cells": {"C2": "July'26"}},
     {"op": "retarget_refs", "sheet": "AR_07.31",
-     "replace": [{"from": "AR_05.31", "to": "AR_06.30"}]}
+     "replace": [{"from": "AR_05.31", "to": "AR_06.30"},
+                 {"from": "AR_06.30", "to": "AR_07.31"}]}
   ]
 }
 
-retarget_refs: rewrites cross-sheet references in one sheet's formulas —
-the duplicated AR tab inherits the SOURCE month's prior-month references
-(July's tab copied from June still points at May), so n8n should send
-from = two-months-back tab name, to = the duplicate_sheet source. Both
-'AR_05.31'! (quoted) and AR_05.31! (unquoted) forms are matched. The job
-FAILS if a supplied mapping makes zero replacements.
+retarget_refs: rolls the duplicated sheet's inherited cross-sheet
+references forward one month. n8n sends BOTH mappings of the month roll:
+two-months-back -> prior (for data-style refs) AND prior -> the new tab
+itself (for header formulas like L2 = prior!V4 - self!L3). Mappings are
+applied SIMULTANEOUSLY in one pass, so the chained rename cannot cascade,
+and they touch only INHERITED content — formulas the extract writes are
+excluded by construction. Both 'AR_05.31'! (quoted) and AR_05.31!
+(unquoted) forms are matched. The job FAILS if ANY supplied mapping makes
+zero replacements (reported per sheet as perMapping in opsResults).
 Unknown top-level fields are REJECTED (422). This is deliberate: the model
 used to ignore extras, and a payload whose `extract` block was silently
 dropped reported "done" after uploading an unmodified 111MB file.
