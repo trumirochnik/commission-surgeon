@@ -76,6 +76,7 @@ from pydantic import BaseModel, ConfigDict
 
 from surgeon import XlsxSurgeon
 from commission_job import run_extract, build_ops
+import xlsx_read as xr
 
 try:
     import resource   # Linux/Render only — absent on Windows, diagnostic-only
@@ -192,6 +193,260 @@ class Job(BaseModel):
     # keep the output on disk and serve it at GET /jobs/{id}/result
     # (testing aid — the file survives until the next restart/redeploy)
     keepResult: bool = False
+    # read cell values back to the caller AFTER ops are applied:
+    # [{"sheet": "Dashboard", "range": "W6:W24", "as": "endingBalances"}]
+    readRanges: list[dict] | None = None
+    # fail the job on layout drift BEFORE pasting:
+    # [{"sheet": "AR_07.31", "row": 6, "expect": "A:X"}]
+    headerGuard: list[dict] | None = None
+    # read-only workbook discovery (parts/pivots/rows); when omitted on an
+    # extract job a default discovery spec runs — it is cheap and its output
+    # feeds the reporting-half design work
+    inspect: dict | None = None
+
+
+# Verified header layout (ground truth: the AGA saved-search CSV export +
+# the delivered workbook). Tuples = accepted variants. Comparison is
+# whitespace-normalized and case-insensitive — the guard exists to catch
+# COLUMN SHIFT, not cosmetic drift.
+_AR_HDR = [
+    "Client:Project", "Customer_Type", "Client Category: Name",
+    "First Sale Date", "Store_Type", "Date", "Transaction Type", "No.",
+    "Item: Full Name", "Item: Description (Sales)", "Quantity",
+    "Open Balance", "Sales Rep: Name (Grouped)",
+    "Address: Shipping Address State", "Partner",
+    "Partner: Partner Category/Role", "Commission Pct",
+    "Transaction Status: Description", "Due Date", "Date Closed",
+    "Primary Partner: Name", "Amount (Gross)", "Account: Name (GL-style)",
+    "Company Name",
+]
+_SALES_HDR = list(_AR_HDR[:22])
+_SALES_HDR[11] = ("Amount", "Open Balance")     # L differs between tabs
+_SALES_HDR[15] = "Client: Partner"              # P: person, not category
+_SALES_HDR += ["Month", "Client Age (Years)", ("Company name", "Company Name")]
+EXPECTED_HEADERS = {"A:X": _AR_HDR, "A:Y": _SALES_HDR}
+
+
+def _hdr_norm(s) -> str:
+    return re.sub(r"\s+", " ", str(s or "")).strip().casefold()
+
+
+def _run_header_guard(src: str, guards: list[dict], ops: list[dict]) -> list[dict]:
+    """SOP step 7: verify the header row matches the verified layout before
+    anything is pasted. Raises on the first mismatch, naming sheet, column,
+    expected and actual. A guarded sheet that a duplicate_sheet op will
+    CREATE is checked against its dup SOURCE's header (that is where the
+    header will come from)."""
+    dup_source = {op.get("name"): op.get("source")
+                  for op in ops if op.get("op") == "duplicate_sheet"}
+    s = XlsxSurgeon(src, workdir=WORK)
+    report = []
+    with zipfile.ZipFile(src) as zf:
+        fetched = []
+        for gd in guards or []:
+            sheet, row = gd["sheet"], int(gd["row"])
+            expect = EXPECTED_HEADERS.get(str(gd["expect"]).upper())
+            if expect is None:
+                raise ValueError(f"headerGuard: unknown expect {gd['expect']!r}")
+            read_sheet = sheet if sheet in s._sheet_parts else dup_source.get(sheet)
+            if not read_sheet or read_sheet not in s._sheet_parts:
+                raise ValueError(f"headerGuard: sheet {sheet!r} not found "
+                                 "(and no duplicate_sheet op creates it)")
+            cells = xr.stream_rows(zf, s._sheet_parts[read_sheet],
+                                   row, row).get(row, {})
+            fetched.append((sheet, read_sheet, row, expect, cells))
+        shared = xr.resolve_shared(
+            zf, set().union(*[xr.shared_indices(c.values())
+                              for *_x, c in fetched]) if fetched else set())
+    for sheet, read_sheet, row, expect, cells in fetched:
+        for i, exp in enumerate(expect):
+            letter = xr.col_letter(i + 1)
+            actual = xr.cell_value(cells.get(letter), shared)
+            variants = exp if isinstance(exp, tuple) else (exp,)
+            if _hdr_norm(actual) not in {_hdr_norm(v) for v in variants}:
+                raise ValueError(
+                    f"headerGuard FAILED on {sheet!r} (read from "
+                    f"{read_sheet!r} row {row}) column {letter}: expected "
+                    f"{variants[0]!r}, found {actual!r} — refusing to paste "
+                    "into a shifted layout")
+        report.append({"sheet": sheet, "readFrom": read_sheet, "row": row,
+                       "columns": len(expect), "status": "ok"})
+    return report
+
+
+def _run_read_ranges(path: str, specs: list[dict], j: dict) -> None:
+    """Read requested ranges from the FINISHED output (after ops), resolving
+    shared strings, and expose them keyed by their 'as' names. Values are
+    row-major lists of row-arrays (callers flatten). Sheets over the 32MB
+    in-memory threshold are refused per-range, not per-job."""
+    s = XlsxSurgeon(path, workdir=WORK)
+    out: dict = {}
+    errors: dict = {}
+    with zipfile.ZipFile(path) as zf:
+        pending = []
+        for spec in specs or []:
+            name = spec.get("as") or spec.get("range")
+            sheet, rng = spec.get("sheet"), spec.get("range")
+            part = s._sheet_parts.get(sheet)
+            if not part:
+                errors[name] = f"sheet {sheet!r} not found"
+                continue
+            if zf.getinfo(part).file_size > 32 * 1024 * 1024:
+                errors[name] = (f"sheet {sheet!r} is "
+                                f"{zf.getinfo(part).file_size // 1048576}MB "
+                                "decompressed — refusing to read ranges off it")
+                continue
+            try:
+                c_lo, c_hi, r_lo, r_hi = xr.parse_range(rng)
+            except ValueError as e:
+                errors[name] = str(e)
+                continue
+            rows = xr.stream_rows(zf, part, r_lo or 1, r_hi or 10 ** 7)
+            pending.append((name, c_lo, c_hi, r_lo, r_hi, rows))
+        need = set()
+        for *_a, rows in pending:
+            for rc in rows.values():
+                need |= xr.shared_indices(rc.values())
+        shared = xr.resolve_shared(zf, need)
+    for name, c_lo, c_hi, r_lo, r_hi, rows in pending:
+        if r_lo is not None:
+            row_nums = list(range(r_lo, r_hi + 1))
+        else:
+            row_nums = sorted(rows)
+        vals = []
+        for rn in row_nums:
+            rc = rows.get(rn, {})
+            row_vals = [xr.cell_value(rc.get(xr.col_letter(c)), shared)
+                        for c in range(c_lo, c_hi + 1)]
+            if r_lo is None and all(v is None for v in row_vals):
+                continue          # unbounded ranges skip fully-empty rows
+            vals.append(row_vals)
+        out[name] = vals
+    if out:
+        j["readRanges"] = out
+    if errors:
+        j["readRangesErrors"] = errors
+
+
+_DISCOVERY_ROWS = [
+    {"sheet": "Data", "rows": "1:8"},
+    {"sheet": "Compiled Data", "rows": "1:10"},
+    {"sheet": "Payment", "rows": "1:40"},
+    {"sheet": "Dashboard", "rows": "1:40"},
+    {"sheet": "Info", "rows": "1:40"},
+    {"sheet": "Kevin Hanks", "rows": "1:30"},
+    {"sheet": "Tiffany M.", "rows": "1:30"},
+    {"sheet": "Partial Payments", "rows": "1:12"},
+]
+
+
+def _run_inspect(src: str, spec: dict) -> dict:
+    """Read-only workbook discovery on the DOWNLOADED source copy: part
+    inventory with sizes and dimensions, pivot-table definitions (the
+    question that decides whether the reporting half is automatable at
+    all), and value+formula dumps of requested head rows. Never fatal."""
+    s = XlsxSurgeon(src, workdir=WORK)
+    out: dict = {"sheetNames": s.sheet_names()}
+    with zipfile.ZipFile(src) as zf:
+        names = zf.namelist()
+        if spec.get("parts", True):
+            parts = {}
+            for sheet, part in s._sheet_parts.items():
+                try:
+                    parts[sheet] = {
+                        "part": part,
+                        "bytes": zf.getinfo(part).file_size,
+                        "dimension": xr.part_dimension(zf, part)}
+                except (KeyError, OSError) as e:
+                    parts[sheet] = {"part": part, "error": str(e)[:120]}
+            out["parts"] = parts
+            out["pivotParts"] = [n for n in names if "pivot" in n.lower()]
+        if spec.get("pivots", True):
+            pivots = []
+            for pt in [n for n in names
+                       if re.match(r"xl/pivotTables/pivotTable\d+\.xml$", n)]:
+                try:
+                    px = zf.read(pt).decode("utf-8", "replace")
+                    info = {"part": pt}
+                    m = re.search(r'<pivotTableDefinition[^>]*\bname="([^"]*)"', px)
+                    info["name"] = m.group(1) if m else None
+                    m = re.search(r'\bcacheId="(\d+)"', px)
+                    info["cacheId"] = m.group(1) if m else None
+                    rels = re.sub(r"(pivotTables/)(pivotTable\d+\.xml)$",
+                                  r"\1_rels/\2.rels", pt)
+                    cache_part = None
+                    if rels in names:
+                        rx = zf.read(rels).decode("utf-8", "replace")
+                        cm = re.search(r'Target="([^"]*pivotCacheDefinition[^"]*)"', rx)
+                        if cm:
+                            cache_part = "xl/" + cm.group(1).replace("../", "")
+                    field_names = []
+                    if cache_part and cache_part in names:
+                        cx = zf.read(cache_part).decode("utf-8", "replace")
+                        sm = re.search(r'<worksheetSource[^>]*\bref="([^"]*)"[^>]*\bsheet="([^"]*)"', cx) \
+                            or re.search(r'<worksheetSource[^>]*\bsheet="([^"]*)"[^>]*\bref="([^"]*)"', cx)
+                        if sm:
+                            g1, g2 = sm.group(1), sm.group(2)
+                            ref, sheet = (g1, g2) if ":" in g1 or g1[:1].isalpha() and any(ch.isdigit() for ch in g1) else (g2, g1)
+                            info["cacheSource"] = {"sheet": sheet, "ref": ref}
+                        field_names = re.findall(r'<cacheField[^>]*\bname="([^"]*)"', cx)
+                        info["cachePart"] = cache_part
+                    def fname(ix):
+                        try:
+                            ix = int(ix)
+                        except ValueError:
+                            return ix
+                        if ix == -2:
+                            return "(values)"
+                        return field_names[ix] if 0 <= ix < len(field_names) else f"field{ix}"
+                    rf = re.search(r"<rowFields\b.*?</rowFields>", px, re.S)
+                    cf = re.search(r"<colFields\b.*?</colFields>", px, re.S)
+                    info["rowFields"] = [fname(x) for x in
+                                         re.findall(r'<field x="(-?\d+)"', rf.group(0))] if rf else []
+                    info["colFields"] = [fname(x) for x in
+                                         re.findall(r'<field x="(-?\d+)"', cf.group(0))] if cf else []
+                    info["dataFields"] = re.findall(r'<dataField[^>]*\bname="([^"]*)"', px)
+                    pivots.append(info)
+                except Exception as e:  # noqa: BLE001
+                    pivots.append({"part": pt, "error": str(e)[:200]})
+            out["pivots"] = pivots
+        row_specs = spec.get("rows", _DISCOVERY_ROWS)
+        dumped: dict = {}
+        need = set()
+        fetched = []
+        for rs in row_specs:
+            sheet = rs["sheet"]
+            part = s._sheet_parts.get(sheet)
+            if not part:
+                dumped[sheet] = {"error": "sheet not found"}
+                continue
+            m = re.match(r"^(\d+):(\d+)$", str(rs["rows"]))
+            lo, hi = (int(m.group(1)), int(m.group(2))) if m else (1, 8)
+            rows = xr.stream_rows(zf, part, lo, hi)
+            fetched.append((sheet, rows))
+            for rc in rows.values():
+                need |= xr.shared_indices(rc.values())
+        shared = xr.resolve_shared(zf, need)
+        for sheet, rows in fetched:
+            sheet_dump = {}
+            for rn in sorted(rows):
+                rowd = {}
+                for col, cell in rows[rn].items():
+                    v = xr.cell_value(cell, shared)
+                    if isinstance(v, str) and len(v) > 200:
+                        v = v[:200] + "…"
+                    ent = {}
+                    if v is not None:
+                        ent["v"] = v
+                    if cell.get("f"):
+                        ent["f"] = cell["f"][:300]
+                    if ent:
+                        rowd[col] = ent
+                if rowd:
+                    sheet_dump[str(rn)] = rowd
+            dumped[sheet] = sheet_dump
+        out["rows"] = dumped
+    return out
 
 
 def _auto_probes(job: "Job") -> list[dict]:
@@ -364,6 +619,21 @@ def _run(job_id: str, job: Job):
         _mem_checkpoint(j, "download")
         _persist_jobs()
 
+        # fail on layout drift BEFORE spending 5 minutes on the extract —
+        # a guard failure here is the job working as designed
+        if job.headerGuard:
+            j["stage"] = "headerGuard"
+            j["headerGuard"] = _run_header_guard(src, job.headerGuard, job.ops)
+            _persist_jobs()
+
+        if job.inspect is not None or job.extract:
+            j["stage"] = "inspect"
+            try:
+                j["inspect"] = _run_inspect(src, job.inspect or {})
+            except Exception as ie:  # noqa: BLE001 — discovery must never kill a job
+                j["inspect"] = {"error": str(ie)[:400]}
+            _persist_jobs()
+
         probes = _auto_probes(job) if job.extract else (job.probe or [])
         if probes:
             j["stage"] = "probe"
@@ -395,6 +665,8 @@ def _run(job_id: str, job: Job):
                 arRows=data["arCount"], salesRows=data["salesCount"],
                 arOpenBalance=data["arOpenBalance"], txnCount=data["txnCount"],
                 extractDiagnostics=data["diagnostics"], opsReport=report,
+                newItems=data.get("newItems", []),
+                newItemsBasis=data.get("newItemsBasis"),
             )
             if data["arCount"] < 1000 or data["salesCount"] < 100:
                 raise ValueError(
@@ -490,6 +762,27 @@ def _run(job_id: str, job: Job):
         j["outputMB"] = round(os.path.getsize(dst) / 1048576, 1)
         _persist_jobs()
 
+        if job.readRanges:
+            j["stage"] = "readRanges"
+            try:
+                _run_read_ranges(dst, job.readRanges, j)
+            except Exception as re_err:  # noqa: BLE001 — reads must not kill the job
+                j["readRangesErrors"] = {"_fatal": str(re_err)[:400]}
+            # newItems exclusion: drop SKUs already on 'Commission Rate by
+            # SKUs' when that range was requested (first column = SKU)
+            sku_rows = (j.get("readRanges") or {}).get("skuRates")
+            if sku_rows and j.get("newItems"):
+                def _norm_sku(v):
+                    if isinstance(v, float) and v.is_integer():
+                        return str(int(v))
+                    return str(v).strip()
+                known = {_norm_sku(r[0]) for r in sku_rows if r and r[0] is not None}
+                before = len(j["newItems"])
+                j["newItems"] = [it for it in j["newItems"]
+                                 if _norm_sku(it["sku"]) not in known]
+                j["newItemsExcludedExisting"] = before - len(j["newItems"])
+            _persist_jobs()
+
         j["stage"] = "upload"
         _persist_jobs()
         final = _upload_file(j, dst, job.uploadUrl)
@@ -529,7 +822,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-19-extract-v17-jobstate"
+VERSION = "2026-08-19-extract-v18-phaseA"
 
 
 @app.get("/health")
@@ -546,6 +839,15 @@ def create_job(job: Job):
     _persist_jobs()
     threading.Thread(target=_run, args=(job_id, job), daemon=True).start()
     return {"jobId": job_id}
+
+
+@app.get("/jobs")
+def list_jobs():
+    """Summaries only — lets an operator find the latest job id after the
+    fact (e.g. to pull inspect/readRanges data from a run n8n started)."""
+    return {jid: {"status": j.get("status"), "stage": j.get("stage"),
+                  "createdAt": j.get("createdAt")}
+            for jid, j in JOBS.items()}
 
 
 @app.get("/jobs/{job_id}")

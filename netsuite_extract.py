@@ -478,6 +478,61 @@ def fetch_accounts(mcp: Mcp, ids: list[str]) -> dict[str, str]:
     return out
 
 
+def fetch_new_items(mcp: Mcp, frm: str, to: str, log=print) -> tuple[list, str]:
+    """SKUs whose FIRST item fulfillment falls inside the period — 'first
+    fulfilled', not merely 'sold this month'. Two steps, both verified live
+    2026-08-19: (1) DISTINCT SKUs shipped (ItemShip) in the period — 637 for
+    July; (2) keyed batches, MIN(trandate) over ALL fulfillment history with
+    a server-side HAVING so only period-first SKUs come back (July: 99416,
+    99417). Falls back to first appearance in SALES history if the role
+    loses fulfillment visibility; the basis string labels which ran."""
+    def q_shipped(kind_types):
+        return f"""
+SELECT DISTINCT i.itemid AS c01
+FROM transaction t
+JOIN transactionline tl ON tl.transaction = t.id AND tl.mainline = 'F'
+JOIN item i ON i.id = tl.item
+WHERE t.type IN ({kind_types})
+  AND t.trandate BETWEEN TO_DATE('{frm}','YYYY-MM-DD') AND TO_DATE('{to}','YYYY-MM-DD')
+  AND i.itemtype IN ('Assembly','InvtPart')
+ORDER BY i.itemid
+""".strip()
+
+    def q_first(kind_types, ids):
+        return f"""
+SELECT i.itemid AS c01, MIN(t.trandate) AS c02
+FROM transaction t
+JOIN transactionline tl ON tl.transaction = t.id AND tl.mainline = 'F'
+JOIN item i ON i.id = tl.item
+WHERE t.type IN ({kind_types})
+  AND i.itemid IN ({sql_list(ids)})
+GROUP BY i.itemid
+HAVING MIN(t.trandate) >= TO_DATE('{frm}','YYYY-MM-DD')
+ORDER BY i.itemid
+""".strip()
+
+    for kinds, basis in (("'ItemShip'", "item_fulfillment"),
+                         (sql_list(TXN_TYPES), "first_sale_fallback")):
+        try:
+            shipped = [str(g(r, 1)) for r in
+                       mcp.rows(q_shipped(kinds), f"new items sweep ({basis})")]
+            log(f"[newitems] {len(shipped)} SKUs moved in period ({basis})")
+            firsts: list[tuple[str, str]] = []
+            for batch in chunks(shipped, ID_BATCH):
+                for r in mcp.rows(q_first(kinds, batch), "new items first-date"):
+                    d = to_date(g(r, 2))
+                    firsts.append((str(g(r, 1)), d.isoformat() if d else str(g(r, 2))))
+            log(f"[newitems] {len(firsts)} first-fulfilled inside period")
+            return firsts, basis
+        except McpError as e:
+            log(f"[newitems] {basis} query failed ({str(e)[:120]}) — "
+                "trying fallback" if basis == "item_fulfillment" else
+                f"[newitems] fallback also failed: {str(e)[:120]}")
+            if basis == "first_sale_fallback":
+                return [], f"unavailable: {str(e)[:160]}"
+    return [], "unavailable"
+
+
 def _dim_lookup(cust: dict | None, key: str) -> Any:
     """Safe read from the customer dimension — the row may have no match."""
     return cust.get(key) if cust else None
@@ -797,6 +852,30 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
     sales_rows, sales_diag = build_sales_rows(sales_raw, cust, items, states,
                                               asof_serial, sign_flip)
 
+    # SOP step 4 input: SKUs first fulfilled inside the period, with units
+    # sold this period (from the lines already extracted) and the real
+    # product description. Consumers exclude SKUs already on the workbook's
+    # 'Commission Rate by SKUs' tab (the service does this when readRanges
+    # supplies that list).
+    first_fulfilled, ni_basis = fetch_new_items(mcp, frm, to, log=log)
+    sf = -1 if sign_flip else 1
+    units_by_sku: dict[str, float] = {}
+    for r in sales_raw:
+        q = num(g(r, 6))
+        if isinstance(q, float):
+            sku = str(g(r, 5))
+            units_by_sku[sku] = units_by_sku.get(sku, 0.0) + q * sf
+    ni_ids = [sku for sku, _d in first_fulfilled if sku not in items]
+    for batch in chunks(ni_ids, CUST_BATCH):
+        for r in mcp.rows(q_items(batch), "new item desc"):
+            desc = g(r, 2)
+            if desc:
+                items[str(g(r, 1))] = re.sub(r"\s+", " ", str(desc)).strip()
+    new_items = [{"sku": sku, "description": items.get(sku),
+                  "firstFulfilled": d,
+                  "unitsSold": round(units_by_sku.get(sku, 0.0), 2)}
+                 for sku, d in first_fulfilled]
+
     ar_total = sum(r[11] for r in ar_rows if isinstance(r[11], float))
     sales_total = sum(r[11] for r in sales_rows if isinstance(r[11], float))
 
@@ -806,6 +885,7 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
         "arOpenBalance": round(ar_total, 2),
         "salesAmount": round(sales_total, 2),
         "txnCount": len(ids),
+        "newItems": new_items, "newItemsBasis": ni_basis,
         "diagnostics": {"ar": ar_diag, "sales": sales_diag,
                         "customers": len(cust), "employeeCodes": len(emp_codes),
                         "employeesUnmapped": unmapped,
