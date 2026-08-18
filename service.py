@@ -51,6 +51,7 @@ Cell values: numbers/strings as-is; strings starting with "=" are formulas.
 import os
 import re
 import threading
+import time
 import traceback
 import uuid
 import zipfile
@@ -206,11 +207,40 @@ def _run(job_id: str, job: Job):
     mid = os.path.join(WORK, f"{job_id}_mid.xlsx")   # phase-1 output for a 2-phase surgery
     try:
         j.update(status="running", stage="download")
-        with requests.get(job.downloadUrl, stream=True, timeout=600) as r:
-            r.raise_for_status()
-            with open(src, "wb") as f:
-                for chunk in r.iter_content(CHUNK_DL):
-                    f.write(chunk)
+        # a single unguarded GET on a ~116MB pull dies to any transient
+        # reset (seen live: ConnectionResetError(104) mid-stream from the
+        # Graph CDN). Retry with Range resumption — Graph download URLs
+        # honor Range, so a retry continues from the break instead of
+        # restarting the whole file.
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                pos = os.path.getsize(src) if os.path.exists(src) else 0
+                hdrs = {"Range": f"bytes={pos}-"} if pos else {}
+                with requests.get(job.downloadUrl, stream=True, timeout=600,
+                                  headers=hdrs) as r:
+                    if pos and r.status_code != 206:
+                        pos = 0        # server ignored Range; restart clean
+                    r.raise_for_status()
+                    with open(src, "ab" if pos else "wb") as f:
+                        for chunk in r.iter_content(CHUNK_DL):
+                            f.write(chunk)
+                break
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.Timeout) as de:
+                if attempts >= 4:
+                    raise
+                j["downloadRetries"] = attempts
+                print(f"[dl] attempt {attempts} broke at "
+                     f"{os.path.getsize(src) if os.path.exists(src) else 0} bytes "
+                     f"({de}); retrying", flush=True)
+                time.sleep(5 * attempts)
+        if job.fileSize and os.path.getsize(src) != job.fileSize:
+            raise ValueError(
+                f"download incomplete: got {os.path.getsize(src)} bytes, "
+                f"expected {job.fileSize} — refusing to operate on a truncated file")
         j["downloadedMB"] = round(os.path.getsize(src) / 1048576, 1)
         _mem_checkpoint(j, "download")
 
@@ -341,10 +371,22 @@ def _run(job_id: str, job: Job):
             while pos < size:
                 chunk = f.read(CHUNK_UL)
                 end = pos + len(chunk) - 1
-                resp = requests.put(
-                    job.uploadUrl, data=chunk, timeout=600,
-                    headers={"Content-Length": str(len(chunk)),
-                             "Content-Range": f"bytes {pos}-{end}/{size}"})
+                for attempt in range(1, 4):
+                    try:
+                        resp = requests.put(
+                            job.uploadUrl, data=chunk, timeout=600,
+                            headers={"Content-Length": str(len(chunk)),
+                                     "Content-Range": f"bytes {pos}-{end}/{size}"})
+                        break
+                    except (requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout) as ue:
+                        # Graph upload sessions are resumable; re-PUTting the
+                        # same byte range after a transient reset is safe
+                        if attempt >= 3:
+                            raise
+                        print(f"[ul] chunk {pos}-{end} attempt {attempt} "
+                             f"broke ({ue}); retrying", flush=True)
+                        time.sleep(5 * attempt)
                 if resp.status_code not in (200, 201, 202):
                     raise RuntimeError(
                         f"upload chunk failed {resp.status_code}: {resp.text[:300]}")
@@ -372,7 +414,7 @@ def _run(job_id: str, job: Job):
                 pass
 
 
-VERSION = "2026-08-18-extract-v10-streamdup"
+VERSION = "2026-08-18-extract-v11-dlretry"
 
 
 @app.get("/health")
