@@ -200,6 +200,40 @@ def _probe_formulas(src: str, probes: list[dict]) -> dict:
     return out
 
 
+def _upload_file(j: dict, path: str, upload_url: str) -> dict:
+    """Chunked PUT of `path` to a Graph upload session, with per-chunk retry
+    on transient resets. Returns the final driveItem JSON (or {})."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        pos = 0
+        resp = None
+        while pos < size:
+            chunk = f.read(CHUNK_UL)
+            end = pos + len(chunk) - 1
+            for attempt in range(1, 4):
+                try:
+                    resp = requests.put(
+                        upload_url, data=chunk, timeout=600,
+                        headers={"Content-Length": str(len(chunk)),
+                                 "Content-Range": f"bytes {pos}-{end}/{size}"})
+                    break
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout) as ue:
+                    # Graph upload sessions are resumable; re-PUTting the
+                    # same byte range after a transient reset is safe
+                    if attempt >= 3:
+                        raise
+                    print(f"[ul] chunk {pos}-{end} attempt {attempt} "
+                         f"broke ({ue}); retrying", flush=True)
+                    time.sleep(5 * attempt)
+            if resp.status_code not in (200, 201, 202):
+                raise RuntimeError(
+                    f"upload chunk failed {resp.status_code}: {resp.text[:300]}")
+            pos = end + 1
+            j["uploadedPct"] = round(pos / size * 100)
+        return resp.json() if (resp is not None and resp.text) else {}
+
+
 def _run(job_id: str, job: Job):
     j = JOBS[job_id]
     src = os.path.join(WORK, f"{job_id}_src.xlsx")
@@ -365,34 +399,7 @@ def _run(job_id: str, job: Job):
         j["outputMB"] = round(os.path.getsize(dst) / 1048576, 1)
 
         j["stage"] = "upload"
-        size = os.path.getsize(dst)
-        with open(dst, "rb") as f:
-            pos = 0
-            while pos < size:
-                chunk = f.read(CHUNK_UL)
-                end = pos + len(chunk) - 1
-                for attempt in range(1, 4):
-                    try:
-                        resp = requests.put(
-                            job.uploadUrl, data=chunk, timeout=600,
-                            headers={"Content-Length": str(len(chunk)),
-                                     "Content-Range": f"bytes {pos}-{end}/{size}"})
-                        break
-                    except (requests.exceptions.ConnectionError,
-                            requests.exceptions.Timeout) as ue:
-                        # Graph upload sessions are resumable; re-PUTting the
-                        # same byte range after a transient reset is safe
-                        if attempt >= 3:
-                            raise
-                        print(f"[ul] chunk {pos}-{end} attempt {attempt} "
-                             f"broke ({ue}); retrying", flush=True)
-                        time.sleep(5 * attempt)
-                if resp.status_code not in (200, 201, 202):
-                    raise RuntimeError(
-                        f"upload chunk failed {resp.status_code}: {resp.text[:300]}")
-                pos = end + 1
-                j["uploadedPct"] = round(pos / size * 100)
-            final = resp.json() if resp.text else {}
+        final = _upload_file(j, dst, job.uploadUrl)
         _mem_checkpoint(j, "upload")
         j.update(status="done", stage="complete",
                  resultItemId=final.get("id"),
@@ -402,9 +409,21 @@ def _run(job_id: str, job: Job):
         j.update(status="failed", error=str(e)[:800],
                  trace=traceback.format_exc()[-1200:])
     finally:
-        keep = {dst} if (job.keepResult and os.path.exists(dst)) else set()
+        # keep the finished workbook when explicitly asked (keepResult), and
+        # ALSO when the job died during upload — the surgery took ~10 min of
+        # download+extract+transform and the output is complete; throwing it
+        # away over an upload-session failure forces a full redo when
+        # POST /jobs/{id}/retry-upload with a fresh uploadUrl would do.
+        upload_failed = (j.get("status") == "failed"
+                         and j.get("stage") == "upload")
+        keep = ({dst} if ((job.keepResult or upload_failed)
+                          and os.path.exists(dst)) else set())
         if keep:
             j["resultPath"] = dst
+            if upload_failed:
+                j["recovery"] = ("output kept — POST /jobs/{id}/retry-upload "
+                                 "with a fresh uploadUrl to finish without "
+                                 "redoing the extract/surgery")
         for p in (src, dst, mid):
             if p in keep:
                 continue
@@ -414,7 +433,7 @@ def _run(job_id: str, job: Job):
                 pass
 
 
-VERSION = "2026-08-18-extract-v12-streamsales"
+VERSION = "2026-08-18-extract-v13-uploadrecovery"
 
 
 @app.get("/health")
@@ -437,6 +456,43 @@ def get_job(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(404, "unknown job")
     return JOBS[job_id]
+
+
+class UploadRetry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    uploadUrl: str
+
+
+@app.post("/jobs/{job_id}/retry-upload")
+def retry_upload(job_id: str, body: UploadRetry):
+    """Re-upload a kept result to a FRESH Graph upload session — recovery
+    for jobs whose surgery finished but whose upload session died
+    (itemNotFound: target file deleted mid-run, session expired, etc.).
+    Mint a new uploadUrl (new server-side copy + createUploadSession in
+    n8n) and pass it here; the finished workbook uploads in ~1 minute
+    instead of redoing the whole extract+surgery."""
+    j = JOBS.get(job_id)
+    if not j:
+        raise HTTPException(404, "unknown job")
+    path = j.get("resultPath")
+    if not path or not os.path.exists(path):
+        raise HTTPException(409, "no kept result for this job (service "
+                                 "restarted, or the job failed before the "
+                                 "output was built) — re-run the full job")
+
+    def _do():
+        try:
+            j.update(status="running", stage="upload", error=None)
+            final = _upload_file(j, path, body.uploadUrl)
+            j.update(status="done", stage="complete",
+                     resultItemId=final.get("id"),
+                     resultWebUrl=final.get("webUrl"))
+        except Exception as e:  # noqa: BLE001
+            j.update(status="failed", error=str(e)[:800],
+                     trace=traceback.format_exc()[-1200:])
+
+    threading.Thread(target=_do, daemon=True).start()
+    return {"jobId": job_id, "status": "uploading"}
 
 
 @app.get("/jobs/{job_id}/result")
