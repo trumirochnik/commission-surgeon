@@ -253,6 +253,14 @@ def _run(job_id: str, job: Job):
                 job.ops = list(job.ops) + gen_ops  # APPEND: duplicate_sheet must run first
             else:
                 j["opsSkipped"] = "extract.applyOps=false — extract verified, no pastes generated"
+            # build_ops's _pad() already made independent copies of every
+            # row into gen_ops (now merged into job.ops) — data["arRows"]/
+            # data["salesRows"] (16k+ and 13.5k+ Python lists) are a
+            # redundant SECOND full copy that served no further purpose but
+            # stayed resident for the rest of the job, padding the baseline
+            # apply() started from (measured 185MB before phase 1 even
+            # began — surprisingly high for "downloaded + extracted rows").
+            del data, gen_ops
             _mem_checkpoint(j, "extract")
 
         j["stage"] = "surgery"

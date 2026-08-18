@@ -28,6 +28,16 @@ import tempfile
 CHUNK = 4 * 1024 * 1024
 XLNS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
+try:
+    import resource   # Linux/Render only — absent on Windows, diagnostic-only
+
+    def _mem_log(label: str) -> None:
+        mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+        print(f"[mem] peak RSS {label}: {mb} MB", flush=True)
+except ImportError:
+    def _mem_log(label: str) -> None:
+        pass
+
 
 # ---------------------------------------------------------------- helpers
 def col_letter(n: int) -> str:
@@ -204,7 +214,13 @@ class XlsxSurgeon:
                 for new_name, source in dup_sheets:
                     src_part = self._sheet_parts[source]
                     src_size = zf.getinfo(src_part).file_size
+                    print(f"[mem] duplicate_sheet {source!r}: source part is "
+                         f"{round(src_size / 1048576, 1)} MB compressed", flush=True)
+                    _mem_log(f"before reading {source!r}")
                     xml = zf.read(src_part).decode("utf-8")
+                    print(f"[mem] duplicate_sheet {source!r}: decoded to "
+                         f"{round(len(xml) / 1_000_000, 1)} MB of text", flush=True)
+                    _mem_log(f"after decoding {source!r}")
                     # The copy gets NO _rels part, so ANY surviving r:id is a hard
                     # OPC violation — Excel repairs the file and drops the sheet.
                     # pageSetup carries an r:id whenever the sheet ever had a
@@ -222,6 +238,7 @@ class XlsxSurgeon:
                     xml = re.sub(
                         r"<(?P<wrap>hyperlinks|oleObjects|controls)\s*>\s*</(?P=wrap)>"
                         r"|<(?:hyperlinks|oleObjects|controls)\s*/>", "", xml)
+                    _mem_log(f"after stripping relationship tags on {source!r}")
                     self._assert_no_dangling_rids(f"duplicate of {source!r}", xml, ())
                     # duplicated sheet may still need pastes applied to it later:
                     # apply queued paste/set ops that target the NEW name in-memory now.
@@ -231,8 +248,10 @@ class XlsxSurgeon:
                     paste_groups = [p[2] for p in pend if p[0] == "paste"]
                     cell_groups = [p[2][0] for p in pend if p[0] == "set"]
                     if paste_groups or cell_groups:
+                        _mem_log(f"before paste/set_cells on duplicated {new_name!r}")
                         xml, n = self._apply_row_ops(xml, paste_groups, cell_groups)
                         changed += n
+                        _mem_log(f"after paste/set_cells on duplicated {new_name!r}")
                     results.append({"target": new_name, "kind": "duplicate_sheet",
                                     "sourcePartMB": round(src_size / 1048576, 1),
                                     "cellsChanged": changed})
