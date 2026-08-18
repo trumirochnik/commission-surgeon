@@ -61,6 +61,7 @@ duplicate_sheet must run before the paste that targets the new sheet.
 Cell values: numbers/strings as-is; strings starting with "=" are formulas.
 """
 
+import json
 import os
 import re
 import threading
@@ -109,6 +110,66 @@ CHUNK_DL = 8 * 1024 * 1024
 CHUNK_UL = 32 * 320 * 1024        # 10,485,760 bytes
 
 PROBE_SCAN_CAP = 64 * 1024 * 1024   # stop scanning a sheet part for the probe row
+
+# ── job-state persistence ──────────────────────────────────────────────
+# JOBS used to be memory-only: a Render redeploy/restart/crash mid-job made
+# GET /jobs/{id} 404 ("unknown job") and the n8n poll loop errored out even
+# when the job had actually finished. State now round-trips through a JSON
+# file in /tmp — survives a restart of the same instance/deploy cycle.
+# NOTE: this design (and the polling model) assumes WEB_CONCURRENCY=1.
+# Multiple workers would each hold their own JOBS view and polls would land
+# on the wrong process — if worker count ever needs raising, job state must
+# move to real shared storage first.
+JOBS_FILE = os.path.join(WORK, "jobs.json")
+_JOBS_LOCK = threading.Lock()
+
+
+def _persist_jobs() -> None:
+    """Write-on-transition, atomically (temp file + os.replace) so a crash
+    mid-write can never leave corrupt JSON that breaks the next startup.
+    Volume is tiny — a handful of writes per job."""
+    with _JOBS_LOCK:
+        tmp = JOBS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(JOBS, f)
+        os.replace(tmp, JOBS_FILE)
+
+
+def _load_jobs() -> dict:
+    try:
+        with open(JOBS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    now = time.time()
+    out = {}
+    for jid, j in data.items():
+        if now - j.get("createdAt", now) > 7 * 86400:
+            continue                     # prune entries older than ~7 days
+        if j.get("status") in ("queued", "running"):
+            # the thread that owned this job died with the old process —
+            # mark it failed or n8n polls it forever
+            j.update(status="failed",
+                     error="service restarted while job was running "
+                           f"(stage was {j.get('stage', 'unknown')!r})")
+        out[jid] = j
+    return out
+
+
+JOBS.update(_load_jobs())
+# sweep leaked work files: src+out+part files exceed 230MB per job and leak
+# on a hard crash; anything older than an hour is dead weight
+_sweep_now = time.time()
+for _fn in os.listdir(WORK):
+    _p = os.path.join(WORK, _fn)
+    try:
+        if (_fn != "jobs.json" and os.path.isfile(_p)
+                and _sweep_now - os.path.getmtime(_p) > 3600):
+            os.remove(_p)
+    except OSError:
+        pass
+if JOBS:
+    _persist_jobs()      # persist the restarted-while-running markings
 
 
 class Job(BaseModel):
@@ -258,6 +319,7 @@ def _run(job_id: str, job: Job):
     mid = os.path.join(WORK, f"{job_id}_mid.xlsx")   # phase-1 output for a 2-phase surgery
     try:
         j.update(status="running", stage="download")
+        _persist_jobs()
         # a single unguarded GET on a ~116MB pull dies to any transient
         # reset (seen live: ConnectionResetError(104) mid-stream from the
         # Graph CDN). Retry with Range resumption — Graph download URLs
@@ -294,6 +356,7 @@ def _run(job_id: str, job: Job):
                 f"expected {job.fileSize} — refusing to operate on a truncated file")
         j["downloadedMB"] = round(os.path.getsize(src) / 1048576, 1)
         _mem_checkpoint(j, "download")
+        _persist_jobs()
 
         probes = _auto_probes(job) if job.extract else (job.probe or [])
         if probes:
@@ -303,6 +366,7 @@ def _run(job_id: str, job: Job):
             except Exception as pe:  # noqa: BLE001 — the probe must never kill a job
                 j["formulaProbe"] = {"error": str(pe)[:400]}
             _mem_checkpoint(j, "probe")
+            _persist_jobs()
 
         if job.extract:
             j["stage"] = "extract"
@@ -343,8 +407,10 @@ def _run(job_id: str, job: Job):
             # began — surprisingly high for "downloaded + extracted rows").
             del data, gen_ops
             _mem_checkpoint(j, "extract")
+            _persist_jobs()
 
         j["stage"] = "surgery"
+        _persist_jobs()
         # Split into two sequential apply() calls when an extract ran: AR's
         # duplicate+paste+formulas (~16k rows) and the sales sheet's own
         # paste+formulas (~13.5k rows) are each big enough to matter on
@@ -416,17 +482,21 @@ def _run(job_id: str, job: Job):
             _mem_checkpoint(j, "after_apply")
         j["opsResults"] = results
         j["outputMB"] = round(os.path.getsize(dst) / 1048576, 1)
+        _persist_jobs()
 
         j["stage"] = "upload"
+        _persist_jobs()
         final = _upload_file(j, dst, job.uploadUrl)
         _mem_checkpoint(j, "upload")
         j.update(status="done", stage="complete",
                  resultItemId=final.get("id"),
                  resultWebUrl=final.get("webUrl"))
+        _persist_jobs()
     except Exception as e:  # noqa: BLE001
         _mem_checkpoint(j, f"failed_at_{j.get('stage', 'unknown')}")
         j.update(status="failed", error=str(e)[:800],
                  trace=traceback.format_exc()[-1200:])
+        _persist_jobs()
     finally:
         # keep the finished workbook when explicitly asked (keepResult), and
         # ALSO when the job died during upload — the surgery took ~10 min of
@@ -450,9 +520,10 @@ def _run(job_id: str, job: Job):
                 os.remove(p)
             except OSError:
                 pass
+        _persist_jobs()
 
 
-VERSION = "2026-08-19-extract-v15-retarget2"
+VERSION = "2026-08-19-extract-v16-robustness"
 
 
 @app.get("/health")
@@ -465,7 +536,8 @@ def health():
 @app.post("/jobs")
 def create_job(job: Job):
     job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = {"status": "queued"}
+    JOBS[job_id] = {"status": "queued", "createdAt": time.time()}
+    _persist_jobs()
     threading.Thread(target=_run, args=(job_id, job), daemon=True).start()
     return {"jobId": job_id}
 
@@ -502,6 +574,7 @@ def retry_upload(job_id: str, body: UploadRetry):
     def _do():
         try:
             j.update(status="running", stage="upload", error=None)
+            _persist_jobs()
             final = _upload_file(j, path, body.uploadUrl)
             j.update(status="done", stage="complete",
                      resultItemId=final.get("id"),
@@ -509,6 +582,7 @@ def retry_upload(job_id: str, body: UploadRetry):
         except Exception as e:  # noqa: BLE001
             j.update(status="failed", error=str(e)[:800],
                      trace=traceback.format_exc()[-1200:])
+        _persist_jobs()
 
     threading.Thread(target=_do, daemon=True).start()
     return {"jobId": job_id, "status": "uploading"}

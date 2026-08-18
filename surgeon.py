@@ -288,7 +288,9 @@ class XlsxSurgeon:
                                 f"duplicate of {source!r}", authored_copy=True,
                                 retargets=retargets, retarget_key=new_name)
                         _mem_log(f"after streaming rebuild of {source!r}")
-                        results.append({"target": new_name,
+                        results.append({"op": "duplicate_sheet",
+                                        "sheet": new_name,
+                                        "target": new_name,
                                         "kind": "duplicate_sheet",
                                         "sourcePartMB": round(src_size / 1048576, 1),
                                         "streamed": True,
@@ -322,7 +324,8 @@ class XlsxSurgeon:
                         xml, n = self._apply_row_ops(xml, paste_groups, cell_groups)
                         changed += n
                         _mem_log(f"after paste/set_cells on duplicated {new_name!r}")
-                    results.append({"target": new_name, "kind": "duplicate_sheet",
+                    results.append({"op": "duplicate_sheet", "sheet": new_name,
+                                    "target": new_name, "kind": "duplicate_sheet",
                                     "sourcePartMB": round(src_size / 1048576, 1),
                                     "cellsChanged": changed})
                     new_sheets.append((new_name, ("__RAW__", xml)))
@@ -359,7 +362,8 @@ class XlsxSurgeon:
                 elif rows == "__FILE__":
                     new_parts.append((part, ("__FILE__", styles)))  # styles holds a path
                 else:
-                    results.append({"target": name, "kind": "add_sheet",
+                    results.append({"op": "add_sheet", "sheet": name,
+                                    "target": name, "kind": "add_sheet",
                                     "cellsChanged": max(
                                         1, sum(len(r) for r in rows))})
                     new_parts.append((part, self._build_sheet_xml(rows, styles)))
@@ -415,7 +419,9 @@ class XlsxSurgeon:
                     # transforms only rewrite <row>/<c> content, which never
                     # carries r:id, and the part's own _rels streams through
                     # untouched — so no dangling-rid scan is needed here.
-                    results.append({"target": part_to_name.get(name, name),
+                    results.append({"op": "transform",
+                                    "sheet": part_to_name.get(name, name),
+                                    "target": part_to_name.get(name, name),
                                     "kind": "transform",
                                     "cellsChanged": changed})
                     zi = zipfile.ZipInfo(name)
@@ -461,7 +467,8 @@ class XlsxSurgeon:
                             "refusing: either the mapping is wrong or the "
                             "stale references it was meant to fix don't exist")
         for sheet, per_from in self._retarget_counts.items():
-            results.append({"target": sheet, "kind": "retarget_refs",
+            results.append({"op": "retarget_refs", "sheet": sheet,
+                            "target": sheet, "kind": "retarget_refs",
                             "replacements": sum(per_from.values()),
                             "perMapping": dict(per_from), "cellsChanged": 0})
 
@@ -890,18 +897,25 @@ class XlsxSurgeon:
                 row_colvals.setdefault(row, {})[col] = val
                 write_refs.append((ref, val))
 
-        changed = sum(len(cv) for cv in row_colvals.values())
+        # cellsChanged counts writes into rows whose serialized content
+        # ACTUALLY changed: a rebuilt row byte-identical to the original
+        # contributes zero, so re-writing our own prior output is a
+        # detectable no-op. (A same VALUE re-encoded differently — e.g. an
+        # Excel-authored sharedString cell vs our inline string — still
+        # counts as a change; comparison is at the fragment level.)
+        changed = 0
 
         pending = sorted(row_colvals)   # touched rows, ascending; may or may
         pi = 0                          # not exist in the source
         out_pieces = []
 
         def flush_new_before(limit):
-            nonlocal pi
+            nonlocal pi, changed
             while pi < len(pending) and pending[pi] < limit:
                 rn = pending[pi]
                 out_pieces.append(self._rebuild_row(
                     f'<row r="{rn}"></row>', rn, row_colvals[rn]))
+                changed += len(row_colvals[rn])   # brand-new row: all writes count
                 pi += 1
 
         row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*)?(?:/>|>.*?</row>)', re.S)
@@ -911,16 +925,21 @@ class XlsxSurgeon:
                                    # genuinely missing from the source
             colvals = row_colvals.get(rn)
             if colvals is not None:
-                out_pieces.append(self._rebuild_row(m.group(0), rn, colvals))
+                frag = self._rebuild_row(m.group(0), rn, colvals)
+                if frag != m.group(0):
+                    changed += len(colvals)
+                out_pieces.append(frag)
                 if pi < len(pending) and pending[pi] == rn:
                     pi += 1        # this row existed after all — consumed
                 continue
             cleared = False
             for block_cols, last_new_row in clear_specs:
                 if rn > last_new_row:
-                    out_pieces.append(self._rebuild_row(
-                        m.group(0), rn, {c: None for c in map(col_letter, block_cols)}))
-                    changed += len(block_cols)
+                    frag = self._rebuild_row(
+                        m.group(0), rn, {c: None for c in map(col_letter, block_cols)})
+                    if frag != m.group(0):
+                        changed += len(block_cols)
+                    out_pieces.append(frag)
                     cleared = True
                     break
             if not cleared:

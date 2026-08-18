@@ -495,6 +495,16 @@ def build_ar_rows(raw: list[dict], cust: dict[str, dict],
     M Sales Rep        N Address(state)  O Partner          P Partner Role
     Q Commission Pct   R Txn status      S Due Date         T Date Closed
     U Primary Partner  V Amount (Gross)  W Account: Name    X Company Name
+
+    KNOWN SOURCE-WORKBOOK DEFECT — DO NOT "FIX" THIS MAPPING TO MATCH IT
+    (found 2026-08-19 inspecting the hand-built 06.2026 file): AR_06.30 has
+    a one-column shift on ~40% of rows — column Q holds the Transaction
+    Status there (sharedString indices 1314="Open", 1468="Paid In Full",
+    written into cells missing the t="s" attribute) and column R is only
+    ~40% filled. THIS output is the correct layout: Q = Commission Pct
+    (customer custentity12 label), R = status, 100% fill. Anyone
+    reconciling Q or R against prior hand-built months will see a
+    difference; that difference is the source's bug, not ours.
     """
     sf = -1 if sign_flip else 1
     out: list[list] = []
