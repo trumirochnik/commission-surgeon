@@ -558,31 +558,70 @@ def _probe_formulas(src: str, probes: list[dict]) -> dict:
 
 
 def _upload_file(j: dict, path: str, upload_url: str) -> dict:
-    """Chunked PUT of `path` to a Graph upload session, with per-chunk retry
-    on transient resets. Returns the final driveItem JSON (or {})."""
+    """Chunked PUT to a Graph upload session using the documented RESUME
+    protocol. The naive version re-PUT the same byte range after a client-
+    side connection error — but if that PUT had actually LANDED server-side
+    and it was the final chunk, Graph finalizes the file and destroys the
+    session, so the blind retry hit a dead session and failed the whole
+    ~15-minute job with 404 "The upload session was not found" (seen live
+    twice). Now: after any connection failure, GET the session for
+    nextExpectedRanges and continue from where the SERVER says it is; a
+    404 on that status probe after the final chunk means the upload in
+    fact completed — finish with a verification caveat instead of failing."""
     size = os.path.getsize(path)
     with open(path, "rb") as f:
         pos = 0
         resp = None
+        stalls = 0
         while pos < size:
+            f.seek(pos)
             chunk = f.read(CHUNK_UL)
             end = pos + len(chunk) - 1
-            for attempt in range(1, 4):
+            try:
+                resp = requests.put(
+                    upload_url, data=chunk, timeout=600,
+                    headers={"Content-Length": str(len(chunk)),
+                             "Content-Range": f"bytes {pos}-{end}/{size}"})
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as ue:
+                stalls += 1
+                if stalls > 6:
+                    raise
+                print(f"[ul] chunk {pos}-{end} broke ({ue}); asking the "
+                      "session where it stands", flush=True)
+                time.sleep(5)
                 try:
-                    resp = requests.put(
-                        upload_url, data=chunk, timeout=600,
-                        headers={"Content-Length": str(len(chunk)),
-                                 "Content-Range": f"bytes {pos}-{end}/{size}"})
-                    break
+                    st = requests.get(upload_url, timeout=60)
                 except (requests.exceptions.ConnectionError,
-                        requests.exceptions.Timeout) as ue:
-                    # Graph upload sessions are resumable; re-PUTting the
-                    # same byte range after a transient reset is safe
-                    if attempt >= 3:
-                        raise
-                    print(f"[ul] chunk {pos}-{end} attempt {attempt} "
-                         f"broke ({ue}); retrying", flush=True)
-                    time.sleep(5 * attempt)
+                        requests.exceptions.Timeout):
+                    continue          # probe also failed; retry same chunk
+                if st.status_code == 404:
+                    if end + 1 >= size:
+                        # final chunk landed before the connection dropped;
+                        # Graph finalized and tore down the session
+                        j["uploadedPct"] = 100
+                        j["uploadCaveat"] = (
+                            "final chunk connection dropped after the server "
+                            "finalized the upload — n8n's Get Final File size "
+                            "check is the confirmation")
+                        print("[ul] session finalized during final-chunk "
+                              "retry; treating as complete", flush=True)
+                        return {}
+                    raise RuntimeError(
+                        "upload session disappeared mid-file (Graph 404 on "
+                        "status probe) — the target file may have been "
+                        "deleted from SharePoint during the run")
+                nxt = (st.json().get("nextExpectedRanges") or [f"{pos}-"])[0]
+                pos = int(str(nxt).split("-")[0])
+                j["uploadedPct"] = round(pos / size * 100)
+                continue
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    "upload chunk failed 404 (upload session not found) — "
+                    "either the TESTP2 target file was deleted from "
+                    "SharePoint mid-run, or the session expired. Re-run; do "
+                    f"not clean the target folder while a run is in flight. "
+                    f"Body: {resp.text[:200]}")
             if resp.status_code not in (200, 201, 202):
                 raise RuntimeError(
                     f"upload chunk failed {resp.status_code}: {resp.text[:300]}")
@@ -844,7 +883,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-20-v21-pivotreload"
+VERSION = "2026-08-20-v22-uploadresume"
 
 
 @app.get("/health")
