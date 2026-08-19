@@ -785,6 +785,8 @@ def _run(job_id: str, job: Job):
                                           op.get("clear_beyond", True))
                 elif kind == "retarget_refs":
                     surgeon.retarget_refs(op["sheet"], op["replace"])
+                elif kind == "replace_formula_text":
+                    surgeon.replace_formula_text(op["sheet"], op["replace"])
                 elif kind == "copy_range_values":
                     surgeon.copy_range_values(op["sheet"], op["from"], op["to"])
                 elif kind == "pivot_refresh_on_load":
@@ -883,7 +885,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-20-v22-uploadresume"
+VERSION = "2026-08-21-v23-dateroll"
 
 
 @app.get("/health")

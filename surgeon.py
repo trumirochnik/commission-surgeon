@@ -276,6 +276,77 @@ class XlsxSurgeon:
         for frm, n in counts.items():
             agg[frm] = agg.get(frm, 0) + n
 
+    def replace_formula_text(self, sheet: str, replace: list):
+        """Rewrite text INSIDE formulas (<f> elements only) on one sheet.
+
+        Exists for the Dashboard date roll, which retarget_refs cannot
+        express: 18 receipt-cutoff formulas hardcode the period boundary as
+        a serial literal ('AR_06.30'!$T:$T,"<46204"), and four E-column
+        formulas carry the accountant's PRIOR-month manual credit-memo
+        adjustments as trailing constants (+H6-1335.11). Mappings are
+        written against the formula as Excel displays it — XML escaping is
+        handled here, values/labels are never touched, and self-closed
+        shared-formula followers (<f t="shared" si="n"/>) are skipped, so a
+        master-formula edit propagates on recalc exactly as Excel intends.
+
+        Each mapping: {"from","to"} literal by default; "regex": true for
+        re.sub semantics (backrefs in "to"); "optional": true to allow zero
+        matches. A non-optional mapping that matches nothing FAILS the job,
+        same contract as retarget_refs — a silent no-op on a month-boundary
+        literal is exactly how a stale cutoff would ship."""
+        if not replace or not all(
+                m.get("from") and m.get("to") is not None for m in replace):
+            raise ValueError(
+                "replace_formula_text needs replace=[{'from':...,'to':...}]")
+        for m in replace:
+            if m.get("regex"):
+                re.compile(m["from"])   # fail fast on a bad pattern
+        pending_dup = any(o[0] == "dup" and o[1] == sheet for o in self._ops)
+        if sheet not in self._sheet_parts and not pending_dup:
+            raise KeyError(f"sheet {sheet!r} not found; have {self.sheet_names()}")
+        self._ops.append(("replacef", sheet, list(replace)))
+
+    _F_ELEM = re.compile(r"(<f(?:\s[^>]*)?>)(.*?)(</f>)", re.S)
+
+    @staticmethod
+    def _xml_unescape_text(s: str) -> str:
+        return (s.replace("&lt;", "<").replace("&gt;", ">")
+                 .replace("&quot;", '"').replace("&apos;", "'")
+                 .replace("&amp;", "&"))
+
+    @staticmethod
+    def _xml_escape_text(s: str) -> str:
+        # element text: & < > must be escaped; quotes stay literal, which is
+        # exactly how Excel itself writes formula text
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _apply_freplace(self, text: str, mappings: list) -> tuple[str, dict]:
+        counts = {m["from"]: 0 for m in mappings}
+        compiled = [(m, re.compile(m["from"]) if m.get("regex") else None)
+                    for m in mappings]
+
+        def sub(match):
+            plain = self._xml_unescape_text(match.group(2))
+            new = plain
+            for m, rx in compiled:
+                if rx is not None:
+                    new, n = rx.subn(m["to"], new)
+                else:
+                    n = new.count(m["from"])
+                    if n:
+                        new = new.replace(m["from"], m["to"])
+                counts[m["from"]] += n
+            if new == plain:
+                return match.group(0)
+            return match.group(1) + self._xml_escape_text(new) + match.group(3)
+
+        return self._F_ELEM.sub(sub, text), counts
+
+    def _note_freplace(self, sheet: str, counts: dict) -> None:
+        agg = self._freplace_counts.setdefault(sheet, {})
+        for frm, n in counts.items():
+            agg[frm] = agg.get(frm, 0) + n
+
     def paste_columns(self, sheet: str, anchor: str, rows: list,
                       clear_beyond: bool = True):
         """Overwrite a rectangular block starting at `anchor` (e.g. 'A7') with
@@ -292,6 +363,7 @@ class XlsxSurgeon:
     # -- application -------------------------------------------------------
     def apply(self, dst_path: str):
         self._retarget_counts: dict[str, int] = {}
+        self._freplace_counts: dict[str, dict] = {}
         # group ops per existing part
         per_part: dict[str, dict] = {}
         new_sheets = []
@@ -310,7 +382,8 @@ class XlsxSurgeon:
                 continue   # targets a duplicated sheet; handled at duplication time
             part = self._sheet_parts[target]
             per_part.setdefault(part, {"set": {}, "append": [], "paste": [],
-                                       "retarget": [], "copyvals": []})
+                                       "retarget": [], "copyvals": [],
+                                       "replacef": []})
             if kind == "set":
                 per_part[part]["set"].update(payload[0])
             elif kind == "paste":
@@ -319,6 +392,8 @@ class XlsxSurgeon:
                 per_part[part]["retarget"].extend(payload)
             elif kind == "copyvals":
                 per_part[part]["copyvals"].append(payload)
+            elif kind == "replacef":
+                per_part[part]["replacef"].extend(payload)
             else:
                 per_part[part]["append"].append(payload)
 
@@ -335,13 +410,18 @@ class XlsxSurgeon:
                     print(f"[mem] duplicate_sheet {source!r}: source part is "
                          f"{round(src_size / 1048576, 1)} MB decompressed", flush=True)
                     pend = [o for o in self._ops if o[1] == new_name
-                            and o[0] in ("paste", "set", "retarget")]
+                            and o[0] in ("paste", "set", "retarget", "replacef")]
                     paste_groups = [p[2] for p in pend if p[0] == "paste"]
                     cell_groups = [p[2][0] for p in pend if p[0] == "set"]
                     retargets = [m for p in pend if p[0] == "retarget"
                                  for m in p[2]]
+                    freplaces = [m for p in pend if p[0] == "replacef"
+                                 for m in p[2]]
 
-                    if self._stream_ok(paste_groups, cell_groups):
+                    # replace_formula_text must see the whole data region,
+                    # which the streaming rebuild deliberately discards —
+                    # so its presence forces the in-memory fallback
+                    if not freplaces and self._stream_ok(paste_groups, cell_groups):
                         _mem_log(f"before streaming rebuild of {source!r}")
                         tmp = os.path.join(self.workdir,
                                            f"dup_{len(new_sheets)}.xml")
@@ -381,6 +461,10 @@ class XlsxSurgeon:
                         xml, rc = self._apply_retargets(xml, retargets)
                         self._note_retargets(new_name, rc)
                         changed += sum(rc.values())
+                    if freplaces:
+                        xml, fc = self._apply_freplace(xml, freplaces)
+                        self._note_freplace(new_name, fc)
+                        changed += sum(fc.values())
                     # ONE merged pass for any queued paste/set ops — see _apply_row_ops.
                     if paste_groups or cell_groups:
                         _mem_log(f"before paste/set_cells on duplicated {new_name!r}")
@@ -479,7 +563,8 @@ class XlsxSurgeon:
                         per_part[name].get("paste", []),
                         per_part[name].get("retarget", []),
                         retarget_key=part_to_name.get(name, name),
-                        copyvals_groups=per_part[name].get("copyvals", []))
+                        copyvals_groups=per_part[name].get("copyvals", []),
+                        replacef_groups=per_part[name].get("replacef", []))
                     # transforms only rewrite <row>/<c> content, which never
                     # carries r:id, and the part's own _rels streams through
                     # untouched — so no dangling-rid scan is needed here.
@@ -552,6 +637,26 @@ class XlsxSurgeon:
                             "target": sheet, "kind": "retarget_refs",
                             "replacements": sum(per_from.values()),
                             "perMapping": dict(per_from), "cellsChanged": 0})
+
+        # same contract for replace_formula_text: every non-optional mapping
+        # must have hit at least once, or the month-boundary literal it was
+        # meant to roll is still sitting in a shipped workbook
+        for kind, target, payload in self._ops:
+            if kind == "replacef":
+                sheet_counts = self._freplace_counts.get(target, {})
+                for m in payload:
+                    if not m.get("optional") and sheet_counts.get(m["from"], 0) == 0:
+                        raise ValueError(
+                            f"replace_formula_text on {target!r}: mapping "
+                            f"{m['from']!r} matched nothing — refusing: either "
+                            "the mapping is wrong or the stale text it was "
+                            "meant to fix doesn't exist")
+        for sheet, per_from in self._freplace_counts.items():
+            results.append({"op": "replace_formula_text", "sheet": sheet,
+                            "target": sheet, "kind": "replace_formula_text",
+                            "replacements": sum(per_from.values()),
+                            "perMapping": dict(per_from),
+                            "cellsChanged": sum(per_from.values())})
 
         if sum(r["cellsChanged"] for r in results) == 0 \
                 and not self._retarget_counts:
@@ -766,7 +871,8 @@ class XlsxSurgeon:
 
     def _transform_sheet(self, src, dst, set_cells, append_groups,
                          paste_groups=None, retarget_groups=None,
-                         retarget_key=None, copyvals_groups=None):
+                         retarget_key=None, copyvals_groups=None,
+                         replacef_groups=None):
         """
         Disk-based transform of one worksheet part.
         Strategy: the file is processed as head (first chunk, holds <dimension>),
@@ -786,7 +892,9 @@ class XlsxSurgeon:
         # pass verbatim (r:id refs stay valid — no stripping).
         if copyvals_groups is None:
             copyvals_groups = []
-        if not copyvals_groups and self._stream_ok(
+        if replacef_groups is None:
+            replacef_groups = []
+        if not copyvals_groups and not replacef_groups and self._stream_ok(
                 paste_groups or [], [set_cells] if set_cells else [],
                 append_groups):
             _mem_log(f"before streaming rebuild of existing part "
@@ -800,7 +908,8 @@ class XlsxSurgeon:
             _mem_log("after streaming rebuild of existing part")
             return changed
 
-        if set_cells or paste_groups or retarget_groups or copyvals_groups:
+        if (set_cells or paste_groups or retarget_groups or copyvals_groups
+                or replacef_groups):
             if size > 32 * 1024 * 1024:
                 raise ValueError("set_cells only supported on sheets < 32MB "
                                  "decompressed; use append_rows for data tabs")
@@ -831,6 +940,10 @@ class XlsxSurgeon:
                 xml, rc = self._apply_retargets(xml, retarget_groups)
                 self._note_retargets(retarget_key or os.path.basename(src), rc)
                 changed += sum(rc.values())
+            if replacef_groups:
+                xml, fc = self._apply_freplace(xml, replacef_groups)
+                self._note_freplace(retarget_key or os.path.basename(src), fc)
+                changed += sum(fc.values())
             if paste_groups or set_cells:
                 xml, n = self._apply_row_ops(
                     xml, paste_groups or [], [set_cells] if set_cells else [])
@@ -929,8 +1042,17 @@ class XlsxSurgeon:
             if ref:
                 cells[col_index(ref.group(1))] = cx
         for col, val in colvals.items():
-            x = cell_xml(f"{col}{row_num}", val)
             ci = col_index(col)
+            # keep the cell's existing style: number formats live there, so
+            # writing a serial into a date-formatted cell (Dashboard C33)
+            # must not degrade it to General
+            style = 0
+            old = cells.get(ci)
+            if old:
+                sm = re.search(r'\ss="(\d+)"', old)
+                if sm:
+                    style = int(sm.group(1))
+            x = cell_xml(f"{col}{row_num}", val, style)
             if x:
                 cells[ci] = x
             else:
