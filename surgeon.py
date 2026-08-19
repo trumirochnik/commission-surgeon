@@ -974,31 +974,25 @@ class XlsxSurgeon:
         for m in re.finditer(r'<row r="(\d+)"', tail[:close_idx]):
             last_row = max(last_row, int(m.group(1)))
 
-        new_rows_xml, appended, ncols_new = [], 0, 0
-        r = last_row
-        for rows, styles in append_groups:
-            for values in rows:
-                r += 1
-                new_rows_xml.append(row_xml(r, values, styles))
-                ncols_new = max(ncols_new, len(values))
-                appended += 1
-                changed += len(values)
-        insertion = "".join(new_rows_xml)
-        tail = tail[:close_idx] + insertion + tail[close_idx:]
+        # ---- appended rows are STREAMED out in 512-row batches, never
+        # joined into one string. The old path built `insertion` (all rows,
+        # ~40MB on the real 'Sales report Raw' append), concatenated it into
+        # `tail` (second copy), then re.sub'd the merged string (third copy)
+        # — a ~160MB transient stack on an already-high phase-2 baseline
+        # (measured 239MB -> 402MB peak in job d02a0c51738c; run
+        # 2ba2c030cd80 crossed 512MB right there and Render killed it).
+        total_new = sum(len(rows) for rows, _s in append_groups)
+        ncols_new = max((len(v) for rows, _s in append_groups for v in rows),
+                        default=0)
+        r_final = last_row + total_new
 
-        # extend autoFilter / dimension end refs that sit in the tail
-        def extend_ref(mm):
-            start, end = mm.group(1), mm.group(2)
-            ec, _ = split_ref(end)
-            ec_i = max(col_index(ec), ncols_new)
-            return f'ref="{start}:{col_letter(ec_i)}{r}"'
-        tail = re.sub(r'ref="([A-Z]+\d+):([A-Z]+\d+)"', extend_ref,
-                      tail[close_idx + len(insertion):]) \
-            .join([tail[:close_idx + len(insertion)], ""]) if False else tail
-        tail = re.sub(r'(<autoFilter[^>]*ref=")([A-Z]+\d+):([A-Z]+\d+)(")',
+        pre = tail[:close_idx]           # kept rows inside the tail window
+        post = tail[close_idx:]          # </sheetData> + autoFilter etc.
+        del tail
+        post = re.sub(r'(<autoFilter[^>]*ref=")([A-Z]+\d+):([A-Z]+\d+)(")',
                       lambda m: f'{m.group(1)}{m.group(2)}:'
-                                f'{m.group(3)[:re.match(r"[A-Z]+", m.group(3)).end()]}{r}{m.group(4)}',
-                      tail)
+                                f'{m.group(3)[:re.match(r"[A-Z]+", m.group(3)).end()]}{r_final}{m.group(4)}',
+                      post)
 
         head_len = min(size - tail_len, 64 * 1024) if size > tail_len else 0
         with open(src, "rb") as fin, open(dst, "wb") as fout:
@@ -1007,7 +1001,7 @@ class XlsxSurgeon:
                 head = re.sub(
                     r'(<dimension ref="[A-Z]+\d+):([A-Z]+)(\d+)(")',
                     lambda m: f'{m.group(1)}:'
-                              f'{col_letter(max(col_index(m.group(2)), ncols_new))}{r}{m.group(4)}',
+                              f'{col_letter(max(col_index(m.group(2)), ncols_new))}{r_final}{m.group(4)}',
                     head, count=1)
                 fout.write(head.encode("utf-8", errors="surrogateescape"))
                 remaining = size - head_len - tail_len
@@ -1017,10 +1011,20 @@ class XlsxSurgeon:
                         break
                     fout.write(buf)
                     remaining -= len(buf)
-            else:
-                # whole file fit in the tail window
-                pass
-            fout.write(tail.encode("utf-8"))
+            fout.write(pre.encode("utf-8"))
+            del pre
+            r = last_row
+            batch: list[str] = []
+            for rows, styles in append_groups:
+                for values in rows:
+                    r += 1
+                    batch.append(row_xml(r, values, styles))
+                    changed += len(values)
+                    if len(batch) >= 512:
+                        fout.write("".join(batch).encode("utf-8"))
+                        batch.clear()
+            fout.write("".join(batch).encode("utf-8"))
+            fout.write(post.encode("utf-8"))
         return changed
 
     def _apply_set_cells(self, xml: str, cells: dict) -> tuple[str, int]:
