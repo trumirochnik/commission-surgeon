@@ -901,7 +901,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v25-streamappend"
+VERSION = "2026-08-21-v26-singlejob"
 
 
 @app.get("/health")
@@ -913,6 +913,22 @@ def health():
 
 @app.post("/jobs")
 def create_job(job: Job):
+    # ONE job at a time. Two ~115MB jobs landed 83s apart on 2026-08-19
+    # (two n8n workflows answered the same trigger) and ran concurrently —
+    # combined RSS blew the 512MB container and BOTH died. A duplicate
+    # trigger now gets a clear 409 instead of killing the run in flight.
+    # Safe across crashes: restart marks running jobs failed at load time.
+    for running_id, rj in JOBS.items():
+        if rj.get("status") in ("queued", "running"):
+            raise HTTPException(
+                409, f"another job is already in flight (id {running_id}, "
+                     f"stage {rj.get('stage', '?')!r}, started "
+                     f"{int(time.time() - rj.get('createdAt', time.time()))}s ago) — "
+                     "this container fits ONE workbook job. If you didn't "
+                     "start it, two n8n workflows are answering the same "
+                     "trigger: deactivate every Commission workflow except "
+                     "the current one. A stale 'running' job clears on "
+                     "service restart.")
     job_id = uuid.uuid4().hex[:12]
     JOBS[job_id] = {"status": "queued", "createdAt": time.time()}
     _persist_jobs()
