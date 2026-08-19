@@ -182,7 +182,14 @@ if JOBS:
 class Job(BaseModel):
     model_config = ConfigDict(extra="forbid")
     downloadUrl: str
-    uploadUrl: str
+    # OPTIONAL since v24: when omitted, the job stops at stage "edited" with
+    # the output kept on disk, and the caller delivers it via
+    # POST /jobs/{id}/retry-upload with a FRESHLY minted uploadUrl. Rationale:
+    # a session minted before the job starts sits idle through ~15 min of
+    # download+extract+surgery, and SharePoint reaps idle sessions — the
+    # third distinct upload-404 incident (2026-08-19) died exactly there.
+    # Late minting makes the session seconds old when the first byte flows.
+    uploadUrl: str | None = None
     fileSize: int | None = None
     extract: dict | None = None
     ops: list[dict] = []
@@ -846,13 +853,20 @@ def _run(job_id: str, job: Job):
                 j["newItemsExcludedExisting"] = before - len(j["newItems"])
             _persist_jobs()
 
-        j["stage"] = "upload"
-        _persist_jobs()
-        final = _upload_file(j, dst, job.uploadUrl)
-        _mem_checkpoint(j, "upload")
-        j.update(status="done", stage="complete",
-                 resultItemId=final.get("id"),
-                 resultWebUrl=final.get("webUrl"))
+        if job.uploadUrl:
+            j["stage"] = "upload"
+            _persist_jobs()
+            final = _upload_file(j, dst, job.uploadUrl)
+            _mem_checkpoint(j, "upload")
+            j.update(status="done", stage="complete",
+                     resultItemId=final.get("id"),
+                     resultWebUrl=final.get("webUrl"))
+        else:
+            # late-mint flow: surgery is finished, delivery happens via
+            # retry-upload with a session minted moments before use
+            j.update(status="done", stage="edited", awaitingUpload=True,
+                     recovery="surgery complete — POST /jobs/{id}/retry-upload "
+                              "with a fresh uploadUrl to deliver the result")
         _persist_jobs()
     except Exception as e:  # noqa: BLE001
         _mem_checkpoint(j, f"failed_at_{j.get('stage', 'unknown')}")
@@ -867,7 +881,9 @@ def _run(job_id: str, job: Job):
         # POST /jobs/{id}/retry-upload with a fresh uploadUrl would do.
         upload_failed = (j.get("status") == "failed"
                          and j.get("stage") == "upload")
-        keep = ({dst} if ((job.keepResult or upload_failed)
+        awaiting = bool(j.get("awaitingUpload"))
+        j["keepResult"] = bool(job.keepResult)   # retry-upload cleanup honors it
+        keep = ({dst} if ((job.keepResult or upload_failed or awaiting)
                           and os.path.exists(dst)) else set())
         if keep:
             j["resultPath"] = dst
@@ -885,7 +901,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v23-dateroll"
+VERSION = "2026-08-21-v24-latemint"
 
 
 @app.get("/health")
@@ -954,6 +970,15 @@ def retry_upload(job_id: str, body: UploadRetry):
             j.update(status="done", stage="complete",
                      resultItemId=final.get("id"),
                      resultWebUrl=final.get("webUrl"))
+            j.pop("awaitingUpload", None)
+            # delivered — drop the 90MB+ temp copy unless the job asked to
+            # keep it (a failed retry keeps resultPath so it can be retried)
+            if not j.get("keepResult"):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                j.pop("resultPath", None)
         except Exception as e:  # noqa: BLE001
             j.update(status="failed", error=str(e)[:800],
                      trace=traceback.format_exc()[-1200:])
