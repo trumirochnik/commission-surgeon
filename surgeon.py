@@ -683,15 +683,22 @@ class XlsxSurgeon:
     def _stream_ok(paste_groups, cell_groups, append_groups=()) -> bool:
         """Streaming rebuild is only equivalent when the ops regenerate the
         data region TOTALLY: at least one paste, every paste clears beyond
-        its block, every formula cell row falls inside some pasted row span,
-        and no appends are mixed in."""
+        its block, every formula cell row falls inside some pasted row span
+        OR sits ABOVE every span (a header cell — applied to the captured
+        prefix, which streams through otherwise verbatim), and no appends
+        are mixed in. Header cells exist because the month roll writes
+        period serials into header rows the data paste never touches:
+        'New Sales report'!AC6 (period end, gates the deposit column) and
+        AR!AD4 (month start, gates the prior-month XLOOKUP branch)."""
         if not paste_groups or append_groups:
             return False
         if not all(c for _a, _r, c in paste_groups):
             return False
         spans = [(split_ref(a)[1], split_ref(a)[1] + len(r) - 1)
                  for a, r, _c in paste_groups]
-        return all(any(lo <= split_ref(ref)[1] <= hi for lo, hi in spans)
+        first_span = min(lo for lo, _hi in spans)
+        return all(split_ref(ref)[1] < first_span
+                   or any(lo <= split_ref(ref)[1] <= hi for lo, hi in spans)
                    for cells in cell_groups for ref in cells)
 
     def _stream_rebuild_rows(self, fin, dst_path: str, paste_groups: list,
@@ -737,10 +744,17 @@ class XlsxSurgeon:
                 d = row_vals.setdefault(a_row + i, {})
                 for jx, v in enumerate(values):
                     d[start + jx] = v
+        # header cells (above every paste span) are applied to the captured
+        # PREFIX; everything else lands in the regenerated data region
+        first_paste = min(split_ref(a)[1] for a, _r, _c in paste_groups)
+        prefix_cells: dict[int, dict[str, object]] = {}
         for cells in cell_groups:
             for ref, val in cells.items():
                 col, rn = split_ref(ref)
-                row_vals.setdefault(rn, {})[col_index(col)] = val
+                if rn < first_paste:
+                    prefix_cells.setdefault(rn, {})[col] = val
+                else:
+                    row_vals.setdefault(rn, {})[col_index(col)] = val
         if not row_vals:
             raise ValueError("streaming rebuild called with no rows")
         first_gen = min(row_vals)
@@ -832,8 +846,30 @@ class XlsxSurgeon:
             self._note_retargets(rkey, c1)
             self._note_retargets(rkey, c2)
 
-        # ---- write: prefix + generated rows (batched) + suffix
+        # ---- apply header cells to the prefix (style-preserving, diff-aware)
         changed = 0
+        for rn in sorted(prefix_cells):
+            colvals = prefix_cells[rn]
+            m = re.search(r'<row r="%d"(?:\s[^>]*)?(?:/>|>.*?</row>)' % rn,
+                          prefix, re.S)
+            if m:
+                frag = self._rebuild_row(m.group(0), rn, colvals)
+                if frag != m.group(0):
+                    changed += len(colvals)
+                prefix = prefix[:m.start()] + frag + prefix[m.end():]
+            else:
+                # row absent from the header region — insert in row order
+                frag = self._rebuild_row(f'<row r="{rn}"></row>', rn, colvals)
+                ins = None
+                for mrow in re.finditer(r'<row r="(\d+)"', prefix):
+                    if int(mrow.group(1)) > rn:
+                        ins = mrow.start()
+                        break
+                prefix = (prefix[:ins] + frag + prefix[ins:]
+                          if ins is not None else prefix + frag)
+                changed += len(colvals)
+
+        # ---- write: prefix + generated rows (batched) + suffix
         with open(dst_path, "w", encoding="utf-8") as out:
             out.write(prefix)
             batch: list[str] = []
