@@ -958,7 +958,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v31-nocycle"
+VERSION = "2026-08-21-v32-parsefix"
 
 
 @app.get("/health")

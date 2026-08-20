@@ -13,8 +13,15 @@ import re
 import zipfile
 
 CHUNK = 4 * 1024 * 1024
+# Self-closed branch FIRST, and attrs lazy ([^>]*?): the old greedy paired
+# branch let ([^>]*) swallow the '/' of an empty cell like <c r="T7" s="4"/>,
+# so its lazy body then consumed the ENTIRE NEXT CELL — T read the neighbor's
+# value and the neighbor vanished. On the hand-built AR tabs (empty cells
+# everywhere) this misattributed U's shared-string index to T on ~17,900
+# rows and cascaded into the 0820-1933 refresh writing a broken U column.
 _CELL_RE = re.compile(
-    r'<c r="([A-Z]+)(\d+)"([^>]*)>(.*?)</c>|<c r="([A-Z]+)(\d+)"([^>]*)/>', re.S)
+    r'<c r="([A-Z]+)(\d+)"([^>]*?)/>'
+    r'|<c r="([A-Z]+)(\d+)"([^>]*?)>(.*?)</c>', re.S)
 _V_RE = re.compile(r"<v>(.*?)</v>", re.S)
 _F_RE = re.compile(r"<f[^>]*>(.*?)</f>", re.S)
 _IS_RE = re.compile(r"<is>.*?</is>", re.S)
@@ -47,10 +54,10 @@ def parse_row_cells(row_xml: str) -> dict:
     """{'A': {'t': type, 'v': raw <v>, 'f': formula, 'is': inline text}}"""
     out = {}
     for m in _CELL_RE.finditer(row_xml):
-        if m.group(1) is not None:
-            col, attrs, body = m.group(1), m.group(3) or "", m.group(4) or ""
+        if m.group(1) is not None:      # self-closed (empty) cell
+            col, attrs, body = m.group(1), m.group(3) or "", ""
         else:
-            col, attrs, body = m.group(5), m.group(7) or "", ""
+            col, attrs, body = m.group(4), m.group(6) or "", m.group(7) or ""
         tm = re.search(r'\bt="([^"]+)"', attrs)
         cell = {"t": tm.group(1) if tm else None, "v": None, "f": None, "is": None}
         vm = _V_RE.search(body)
@@ -74,7 +81,9 @@ def stream_rows(zf: zipfile.ZipFile, part: str, first_row: int, last_row: int,
     rows: dict = {}
     dec = codecs.getincrementaldecoder("utf-8")("replace")
     buf, scanned = "", 0
-    row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*)?(?:/>|>.*?</row>)', re.S)
+    # attrs LAZY: greedy (?:\s[^>]*)? swallowed the '/' of a self-closed
+    # row (<row r="5" ht="15"/>), making its body consume the next row
+    row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*?)?(?:/>|>.*?</row>)', re.S)
     with zf.open(part) as f:
         while scanned < scan_cap:
             b = f.read(CHUNK)

@@ -198,7 +198,7 @@ class XlsxSurgeon:
         import xlsx_read as _xr
         c_lo, c_hi, r_lo, r_hi = _xr.parse_range(rng)
         out = {}
-        row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*)?(?:/>|>.*?</row>)', re.S)
+        row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*?)?(?:/>|>.*?</row>)', re.S)
         for m in row_re.finditer(xml):
             rn = int(m.group(1))
             if rn < r_lo or rn > r_hi:
@@ -850,7 +850,7 @@ class XlsxSurgeon:
         changed = 0
         for rn in sorted(prefix_cells):
             colvals = prefix_cells[rn]
-            m = re.search(r'<row r="%d"(?:\s[^>]*)?(?:/>|>.*?</row>)' % rn,
+            m = re.search(r'<row r="%d"(?:\s[^>]*?)?(?:/>|>.*?</row>)' % rn,
                           prefix, re.S)
             if m:
                 frag = self._rebuild_row(m.group(0), rn, colvals)
@@ -1075,7 +1075,7 @@ class XlsxSurgeon:
             header = header[:-2] + ">"
         else:
             inner = row_frag[len(re.match(r'<row[^>]*>', row_frag).group(0)):-len("</row>")]
-            existing = re.findall(r'<c\b[^>]*(?:/>|>.*?</c>)', inner, re.S)
+            existing = re.findall(r'<c\b[^>]*?(?:/>|>.*?</c>)', inner, re.S)
         cells: dict[int, str] = {}
         for cx in existing:
             ref = re.search(r'r="([A-Z]+)\d+"', cx)
@@ -1178,7 +1178,7 @@ class XlsxSurgeon:
                 changed += len(row_colvals[rn])   # brand-new row: all writes count
                 pi += 1
 
-        row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*)?(?:/>|>.*?</row>)', re.S)
+        row_re = re.compile(r'<row r="(\d+)"(?:\s[^>]*?)?(?:/>|>.*?</row>)', re.S)
         for m in row_re.finditer(body):
             rn = int(m.group(1))
             flush_new_before(rn)   # any pending rows strictly before rn are
