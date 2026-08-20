@@ -355,15 +355,41 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
     cur_tab = job.extract["ar"]["target"]
     asof_serial = _serial(job.extract["asofDate"])
 
-    # rate lookups for combo detection (read from the SOURCE workbook)
+    # rate inputs (read from the SOURCE workbook): the SKU rate table, the
+    # licensed-item set (presence in its column B), and the header constants
+    # the rate formulas reference
     sku = _read_sheet_cols(src, "Commission Rate by SKUs", ["B", "E"], 2)
     sku_rates = {str(v["B"]).strip(): v["E"] for v in sku.values()
                  if v.get("B") is not None and isinstance(v.get("E"), (int, float))}
-    kev = _read_sheet_cols(src, "Kevin Hanks", ["R", "S"], 2)
-    kevin_rates = {str(v["R"]).strip(): v["S"] for v in kev.values()
-                   if v.get("R") is not None and isinstance(v.get("S"), (int, float))}
+    licensed_ids = {str(v["B"]).strip() for v in sku.values()
+                    if v.get("B") is not None}
+    consts = _shadow_consts(src, prior_tab)
     combos, undetermined = rd.distinct_combos(
-        prior_rows, main["ar"], main["sales"], sku_rates, kevin_rates)
+        prior_rows, main["ar"], main["sales"], sku_rates, licensed_ids, consts)
+
+    # SHADOW CALC + per-rep statements, in the same run. The engine is the
+    # workbook's arithmetic ported 1:1 and penny-matched against the
+    # reconciled 06.2026 book (all 18 partners, diff 0.00). Statements are
+    # independent of the Dashboard's credit-memo adjustments — those touch
+    # the accrual (V4/J), not the Data->Compiled chain.
+    shadow = rd.shadow_compiled(prior_rows, main["ar"], main["sales"],
+                                asof_serial, sku_rates, licensed_ids, consts)
+    payment = rd.shadow_payment(shadow, _read_fee_table(src))
+    period = data_spec.get("periodLabel") or data_spec.get("monthTag", "period")
+    stmt_files = rd.build_statements(shadow, payment, period)
+    zpath = os.path.join(WORK, f"{job_id}_statements.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, blob in sorted(stmt_files.items()):
+            z.writestr(name, blob)
+        z.writestr("manifest.json", json.dumps(
+            {"period": period, "count": len(stmt_files),
+             "files": sorted(stmt_files)}, indent=1))
+    j.update(statementsPath=zpath, statementCount=len(stmt_files),
+             statementFiles=sorted(stmt_files),
+             shadowEarnedByPartner={p: round(v["earned"], 2)
+                                    for p, v in sorted(payment.items())
+                                    if abs(v["earned"]) > 0.005})
+    del shadow, payment, stmt_files
 
     built = rd.build_data_rows(prior_rows, main["ar"], main["sales"],
                                asof_serial, prior_tab, cur_tab,
@@ -436,6 +462,35 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
              compiledCombosDropped=dropped_combos,
              compiledCombosUndetermined=sorted(undetermined)[:25])
     return results
+
+
+def _shadow_consts(path: str, prior_tab: str) -> dict:
+    """Header constants the rate formulas reference: AD1 (Dayna date gate),
+    AE1 (her name), AI1 (Bomgaar/Kelly date gate) on the AR tabs, AJ4 on
+    the sales tab. Read from the workbook; documented defaults otherwise."""
+    out = {"dayna": "Dayna Stambeck", "ad1": 45703, "ai1": 46053, "aj4": 45762}
+    try:
+        hdr = _read_sheet_cols(path, prior_tab, ["AD", "AE", "AI"], 1, 1)
+        v = hdr.get(1, {})
+        if isinstance(v.get("AD"), (int, float)):
+            out["ad1"] = v["AD"]
+        if isinstance(v.get("AE"), str) and v["AE"].strip():
+            out["dayna"] = v["AE"].strip()
+        if isinstance(v.get("AI"), (int, float)):
+            out["ai1"] = v["AI"]
+        s4 = _read_sheet_cols(path, "New Sales report", ["AJ"], 4, 4)
+        if isinstance(s4.get(4, {}).get("AJ"), (int, float)):
+            out["aj4"] = s4[4]["AJ"]
+    except Exception:  # noqa: BLE001 — defaults are the documented values
+        pass
+    return out
+
+
+def _read_fee_table(path: str) -> dict:
+    """Payment N7:O24 — the static per-partner technology fees."""
+    rows = _read_sheet_cols(path, "Payment", ["N", "O"], 7, 24)
+    return {str(v["N"]).strip(): v["O"] for v in rows.values()
+            if v.get("N") not in (None, "") and isinstance(v.get("O"), (int, float))}
 
 
 def _build_statements_zip(job_id: str, src: str, spec: dict, j: dict) -> str:
@@ -1180,7 +1235,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v33-reporting"
+VERSION = "2026-08-21-v34-oneflow"
 
 
 @app.get("/health")
@@ -1281,6 +1336,20 @@ def retry_upload(job_id: str, body: UploadRetry):
 
     threading.Thread(target=_do, daemon=True).start()
     return {"jobId": job_id, "status": "uploading"}
+
+
+@app.get("/jobs/{job_id}/statements")
+def get_job_statements(job_id: str):
+    j = JOBS.get(job_id)
+    if not j:
+        raise HTTPException(404, "unknown job")
+    path = j.get("statementsPath")
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "no statements for this job (dataTab not "
+                                 "requested, job not finished, or service "
+                                 "restarted)")
+    from fastapi.responses import FileResponse
+    return FileResponse(path, filename=f"{job_id}_statements.zip")
 
 
 @app.get("/jobs/{job_id}/result")

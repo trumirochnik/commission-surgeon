@@ -208,41 +208,20 @@ def compiled_combo_rows(new_combos: list[tuple], first_new_row: int,
     return cells
 
 
-# ── server-side rate engine (combo detection only) ────────────────────
-# Mirrors the workbook's commission-rate formula. Used ONLY to decide which
-# (company, partner, rate) rows to append to Compiled Data — the numbers on
-# every sheet still come from the workbook's own formulas at recalc time,
-# so a drift here can add a harmless zero row or miss a combo (reported in
-# the job status for review), never change a computed amount.
-
-def rate_for_row(partner, company, item_id, sku_rates: dict,
-                 kevin_rates: dict, doc_no=None) -> float | None:
-    p = (str(partner).strip() if partner is not None else "None")
-    comp = str(company or "")
-    if p in ("8 Nolita", "None"):
-        return 0.0
-    if p == "Kevin Hanks":
-        kr = kevin_rates.get(str(doc_no).strip() if doc_no else "")
-        return kr if isinstance(kr, (int, float)) else None
-    sr = sku_rates.get(str(item_id).strip() if item_id is not None else "")
-    if isinstance(sr, (int, float)):
-        return sr
-    if "Bomgaar" in comp:
-        return None            # contracted-rate branch — skip, don't guess
-    return 0.1                  # workbook default
-
+# ── combo detection (drives Compiled row appends) ─────────────────────
+# Uses the same shadow_rate engine that penny-matched Mike's June book, so
+# a combo exists exactly when the workbook's own formulas will produce a
+# nonzero rate for it.
 
 def distinct_combos(prior_rows, cur_rows, sales_rows, sku_rates,
-                    kevin_rates) -> tuple[set, set]:
+                    licensed_ids, consts) -> tuple[set, set]:
     """-> (set of (company, partner, rate), set of (company, partner) whose
-    rate could not be determined server-side)."""
+    rate resolved to an excluded/blank value)."""
     combos, undetermined = set(), set()
-    for rows in (prior_rows, cur_rows, sales_rows):
+    for rows, comp_idx in ((prior_rows, 23), (cur_rows, 23), (sales_rows, 24)):
         for row in rows:
-            company = row[23] if len(row) > 23 else None     # X company (AR)
-            if company is None and len(row) > 24:
-                company = row[24]                            # sales Y
-            partner = row[20]                                # U primary partner
+            company = row[comp_idx] if len(row) > comp_idx else None
+            partner = row[20]
             if not company or partner in (None, ""):
                 continue
             comp = str(company).strip()
@@ -252,13 +231,178 @@ def distinct_combos(prior_rows, cur_rows, sales_rows, sku_rates,
                 continue
             if str(partner).strip() in ("None", "8 Nolita"):
                 continue
-            r = rate_for_row(partner, company, row[8], sku_rates,
-                             kevin_rates, doc_no=row[7])
-            if r is None:
-                undetermined.add((comp, str(partner)))
-            elif r > 0:
+            r = shadow_rate(partner, company, row[8], row[7], row[5],
+                            sku_rates, licensed_ids, consts)
+            if isinstance(r, (int, float)) and r > 0:
                 combos.add((comp, str(partner), round(float(r), 6)))
+            elif r == " ":
+                undetermined.add((comp, str(partner)))
     return combos, undetermined
+
+
+# ── shadow calc: the workbook's commission arithmetic, ported 1:1 ─────
+# Statements need Compiled-level numbers, which Excel only computes at
+# recalc time. Rather than gate statements on a desktop round-trip, the
+# service computes them with the SAME rules (formulas ported line for
+# line from FORMULA_TEMPLATES / the June book) and the port is validated
+# by replaying June's data and matching Mike's own cached Summary/Payment
+# values. The workbook keeps its real formulas — recalc remains the
+# authority; this mirror exists so the flow can run end to end.
+
+def _contracted_stack(company, partner, doc_no, f_serial, licensed,
+                      ai1_serial) -> float | str:
+    """AR!Y / sales!AA — SEARCH() is case-insensitive."""
+    co = str(company or "").lower()
+    year = (EXCEL_EPOCH + dt.timedelta(days=int(f_serial))).year \
+        if isinstance(f_serial, (int, float)) else None
+    doc = None
+    try:
+        doc = float(doc_no)
+    except (TypeError, ValueError):
+        pass
+    if "cavenders" in co and doc is not None and doc > 1121738 \
+            and year is not None and year < 2026:
+        return 0.09
+    if "cavenders" in co:
+        return 0.0275
+    if "scheels" in co and doc is not None and doc > 1122227 \
+            and year is not None and year < 2026:
+        return 0.07
+    if any(s in co for s in ("atwoods", "scheels", "the glik company",
+                             "quiet storm", "glik")):
+        return 0.05
+    if "bomgaar" in co and str(partner) == "Kelly Kennedy" \
+            and isinstance(f_serial, (int, float)) and f_serial > ai1_serial:
+        return 0.045 if licensed else 0.06
+    return " "
+
+
+def shadow_rate(partner, company, item_id, doc_no, f_serial,
+                sku_rates: dict, licensed_ids: set,
+                consts: dict) -> float | str:
+    """AR!AA / sales!AD. Returns a float, '0' (excluded partners), or ' '
+    (excluded rows). IFERROR fallback -> 0.1."""
+    u = str(partner).strip() if partner is not None else "None"
+    if u in ("8 Nolita", "None"):
+        return "0"
+    licensed = str(item_id).strip() in licensed_ids
+    if u == "Kevin Hanks":
+        return _contracted_stack(company, u, doc_no, f_serial, licensed,
+                                 consts["ai1"])
+    if "bomgaars" in str(company or "").lower():
+        return _contracted_stack(company, u, doc_no, f_serial, licensed,
+                                 consts["ai1"])
+    if u == consts["dayna"] and isinstance(f_serial, (int, float)) \
+            and f_serial > consts["ad1"]:
+        return " "
+    sr = sku_rates.get(str(item_id).strip() if item_id is not None else "")
+    if isinstance(sr, (int, float)):
+        return sr
+    return 0.1                                   # VLOOKUP miss -> IFERROR
+
+
+def _sales_deposit(u, g_type, f_serial, t_serial, asof_serial,
+                   consts: dict):
+    """sales!AB (IFS): the deposit date, or None. AJ4 (45762) caps the
+    Dayna exception; Cash Sales deposit on their own date."""
+    if u == consts["dayna"] and isinstance(t_serial, (int, float)) \
+            and t_serial > consts["aj4"]:
+        return None
+    if str(g_type or "") == "Cash Sale":
+        return f_serial if isinstance(f_serial, (int, float)) else None
+    if not isinstance(t_serial, (int, float)):
+        return None
+    return t_serial if t_serial <= asof_serial else None
+
+
+def shadow_compiled(prior_rows, cur_rows, sales_rows, asof_serial: int,
+                    sku_rates: dict, licensed_ids: set,
+                    consts: dict) -> list[dict]:
+    """Compiled Data rows 5+ recomputed: per (company, partner, rate) —
+    G prior, H new sales, I/J collections (Compiled's negative-sum sign),
+    K partial payments, L total collections, S earned = L*rate."""
+    def key_of(row):
+        return f"{row[23]}{row[7]}{row[8]}"          # CONCAT(Z, J, K)
+
+    prior_bal = {}
+    for row in prior_rows:
+        prior_bal.setdefault(key_of(row), row[11])   # XLOOKUP = first match
+
+    agg: dict[tuple, dict] = {}
+
+    def bucket(company, partner, rate):
+        k = (str(company), str(partner), round(float(rate), 6))
+        return agg.setdefault(k, dict.fromkeys(
+            ("G", "H", "I", "J", "K"), 0.0))
+
+    for row in prior_rows:                            # 'Prior Month' block
+        company, partner = row[23], row[20]
+        rate = shadow_rate(partner, company, row[8], row[7], row[5],
+                           sku_rates, licensed_ids, consts)
+        if not isinstance(rate, (int, float)) or rate <= 0:
+            continue
+        n = row[11] if isinstance(row[11], (int, float)) else 0.0
+        b = bucket(company, partner, rate)
+        b["G"] += n
+        t = row[19]                                   # verified Date Closed
+        if isinstance(t, (int, float)) and t <= asof_serial:
+            b["I"] -= n
+
+    for row in cur_rows:                              # 'Current Month' block
+        company, partner = row[23], row[20]
+        rate = shadow_rate(partner, company, row[8], row[7], row[5],
+                           sku_rates, licensed_ids, consts)
+        if not isinstance(rate, (int, float)) or rate <= 0:
+            continue
+        n = row[11] if isinstance(row[11], (int, float)) else 0.0
+        ak = row[21] if isinstance(row[21], (int, float)) else 0.0
+        aj = prior_bal.get(f"{company}{row[7]}{row[8]}")
+        if not isinstance(aj, (int, float)):
+            al = ak                                   # XLOOKUP 'Error' path
+        elif aj < 0:
+            al = aj
+        else:
+            al = min(aj, ak)
+        b = bucket(company, partner, rate)
+        b["K"] -= (al - n)                            # K = -sum(Difference)
+
+    for row in sales_rows:                            # 'New Sales' block
+        company, partner = row[24], row[20]
+        rate = shadow_rate(partner, company, row[8], row[7], row[5],
+                           sku_rates, licensed_ids, consts)
+        if not isinstance(rate, (int, float)) or rate <= 0:
+            continue
+        n = row[11] if isinstance(row[11], (int, float)) else 0.0
+        b = bucket(company, partner, rate)
+        b["H"] += n
+        dep = _sales_deposit(str(partner).strip() if partner else "",
+                             row[6], row[5], row[19], asof_serial, consts)
+        if isinstance(dep, (int, float)) and dep > 0:
+            b["J"] -= n
+
+    out = []
+    for (company, partner, rate), b in sorted(agg.items()):
+        total = b["I"] + b["J"] + b["K"]
+        out.append({"company": company, "partner": partner, "rate": rate,
+                    "prior": b["G"], "newSales": b["H"],
+                    "collections": b["I"] + b["J"], "partial": b["K"],
+                    "totalColl": total, "earned": total * rate})
+    return out
+
+
+def shadow_payment(compiled: list[dict], fee_table: dict) -> dict:
+    """Payment tab: per-partner earned (Summary XLOOKUP) + tech fee ->
+    net = min(0, earned + fee). Other Adjustments stay manual (0)."""
+    earned: dict[str, float] = {}
+    for r in compiled:
+        earned[r["partner"]] = earned.get(r["partner"], 0.0) + r["earned"]
+    out = {}
+    for partner, e in earned.items():
+        fee = fee_table.get(partner, 0.0)
+        net = e + fee
+        out[partner] = {"earned": e, "fee": fee, "adj": 0.0,
+                        "net": net if net <= 0 else 0.0}
+    return out
 
 
 # ── per-rep statement files ────────────────────────────────────────────

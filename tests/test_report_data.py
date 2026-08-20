@@ -80,20 +80,54 @@ check("keys everywhere", cells["AI11"].startswith("=_xlfn.CONCAT(Z11")
 check("header cells", b["headerCells"] == {"AD4": ASOF, "AB8": ASOF + 1,
       "AG10": "Commission earned on JUL'26"})
 
-# ── combos + rate engine ──
+# ── combos + rate engine (shadow_rate — penny-matched vs June) ──
 sku = {"95302": 0.075}
-kev = {"726770": 0.05}
-combos, undet = rd.distinct_combos(prior, cur, sales, sku, kev)
+LIC = {"95302"}
+CONSTS = {"dayna": "Dayna Stambeck", "ad1": 45703, "ai1": 46053, "aj4": 45762}
+combos, undet = rd.distinct_combos(prior, cur, sales, sku, LIC, CONSTS)
 check("combo detected with SKU rate",
       ("Acme Co", "Tiffany McDaniel", 0.075) in combos, combos)
-combos2, _ = rd.distinct_combos([ar_row(partner="Kevin Hanks")], [], [], sku, kev)
-check("Kevin rate from contracted lookup",
-      ("Acme Co", "Kevin Hanks", 0.05) in combos2, combos2)
-combos3, _ = rd.distinct_combos([ar_row(partner="None")], [], [], {}, {})
+combos2, _ = rd.distinct_combos(
+    [ar_row(partner="Kevin Hanks", company="Cavenders #12")], [], [],
+    sku, LIC, CONSTS)
+check("Kevin rate from the contracted client stack",
+      ("Cavenders #12", "Kevin Hanks", 0.0275) in combos2, combos2)
+combos3, _ = rd.distinct_combos([ar_row(partner="None")], [], [], {}, set(), CONSTS)
 check("None partner excluded (rate 0)", not combos3, combos3)
-combos4, _ = rd.distinct_combos([ar_row(item="UNKNOWN")], [], [], sku, kev)
+combos4, _ = rd.distinct_combos([ar_row(item="UNKNOWN")], [], [], sku, LIC, CONSTS)
 check("unknown SKU -> default 10%",
       ("Acme Co", "Tiffany McDaniel", 0.1) in combos4, combos4)
+check("Bomgaar/Kelly licensed vs core rates",
+      rd.shadow_rate("Kelly Kennedy", "Bomgaars #7", "95302", "1", 46100,
+                     sku, LIC, CONSTS) == 0.045
+      and rd.shadow_rate("Kelly Kennedy", "Bomgaars #7", "X", "1", 46100,
+                         sku, LIC, CONSTS) == 0.06)
+check("Dayna post-gate rows excluded",
+      rd.shadow_rate("Dayna Stambeck", "Acme Co", "X", "1", 46000,
+                     sku, LIC, CONSTS) == " ")
+
+# ── shadow compiled aggregation ──
+sp = [ar_row(closed=46210.0, bal=100.0),          # prior, collected in July
+      ar_row(closed=None, bal=40.0)]              # prior, still open
+sc = [ar_row(bal=30.0, gross=100.0)]              # current: AJ hits prior 100
+ss = [sales_row()]                                # sales: T empty -> no deposit
+for r in sp + sc:
+    r[5] = 46000                                  # F invoice date
+ss[0][5] = 46220; ss[0][19] = 46225               # sales deposited in July
+ss[0][6] = "Invoice"
+sh = rd.shadow_compiled(sp, sc, ss, 46234, {"95302": 0.1}, {"95302"}, CONSTS)
+row = next(r for r in sh if r["partner"] == "Tiffany McDaniel")
+# G=140 prior, I=-100 (collected), K=-(AL-N)=-(100-30)=-70, H=50, J=-50
+check("shadow G/H/I/J/K/earned",
+      abs(row["prior"] - 140) < 1e-9 and abs(row["newSales"] - 50) < 1e-9
+      and abs(row["collections"] + 150) < 1e-9 and abs(row["partial"] + 70) < 1e-9
+      and abs(row["totalColl"] + 220) < 1e-9 and abs(row["earned"] + 22) < 1e-9,
+      row)
+pay2 = rd.shadow_payment(sh, {"Tiffany McDaniel": 100.0})
+check("shadow payment net = min(0, earned+fee)",
+      abs(pay2["Tiffany McDaniel"]["earned"] + 22) < 1e-9
+      and pay2["Tiffany McDaniel"]["net"] == 100.0 - 22 if (100 - 22) <= 0
+      else abs(pay2["Tiffany McDaniel"]["net"]) < 1e-9, pay2)
 
 cc = rd.compiled_combo_rows([("Acme Co", "Tiffany McDaniel", 0.075)],
                             2183, 46000, "JUL'26")
