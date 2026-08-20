@@ -210,6 +210,12 @@ class Job(BaseModel):
     # extract job a default discovery spec runs — it is cheap and its output
     # feeds the reporting-half design work
     inspect: dict | None = None
+    # per-rep statement generation from an ALREADY-RECALCULATED workbook:
+    # {"periodLabel": "07.2026"} — downloads the file, reads Compiled Data
+    # and Payment cached values, builds one small .xlsx per partner, and
+    # keeps them zipped at resultPath (GET /jobs/{id}/result). Refused if
+    # the workbook has not been opened in desktop Excel since surgery.
+    statements: dict | None = None
 
 
 # Verified header layout (ground truth: the AGA saved-search CSV export +
@@ -304,6 +310,182 @@ def _read_prior_rows(path: str, sheet: str, first_row: int) -> list[list]:
         if any(v is not None and v != "" for v in vals):
             out.append(vals)
     return out
+
+
+def _read_sheet_cols(path: str, sheet: str, cols: list[str],
+                     first_row: int, last_row: int = 10 ** 7) -> dict[int, dict]:
+    """{row: {col: value}} for the requested columns, shared strings
+    resolved. For the reporting reads (Compiled Data, Payment, SKU/Kevin
+    rate tabs) — all comfortably small parts."""
+    s = XlsxSurgeon(path, workdir=WORK)
+    part = s._sheet_parts.get(sheet)
+    if not part:
+        raise ValueError(f"sheet {sheet!r} not found")
+    with zipfile.ZipFile(path) as zf:
+        rows = xr.stream_rows(zf, part, first_row, last_row)
+        need = set()
+        for rc in rows.values():
+            need |= xr.shared_indices(rc.values())
+        shared = xr.resolve_shared(zf, need)
+    out: dict[int, dict] = {}
+    for rn, rc in rows.items():
+        vals = {c: xr.cell_value(rc.get(c), shared) for c in cols}
+        if any(v is not None and v != "" for v in vals.values()):
+            out[rn] = vals
+    return out
+
+
+def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
+                         src: str, dst: str, j: dict) -> list[dict]:
+    """Data tab (3 blocks) + Compiled Data range extension + new
+    company/partner/rate combo rows. Runs AFTER phase 2 on its own surgeon
+    so the ~46k-row ops never coexist with the paste phases' memory."""
+    import pickle
+    import report_data as rd
+    from netsuite_extract import serial as _serial
+
+    p_main = os.path.join(WORK, f"{job_id}_report_main.pkl")
+    p_prior = os.path.join(WORK, f"{job_id}_report_prior.pkl")
+    with open(p_main, "rb") as f:
+        main = pickle.load(f)
+    with open(p_prior, "rb") as f:
+        prior_rows = pickle.load(f)
+
+    prior_tab = job.extract["priorAr"]["target"]
+    cur_tab = job.extract["ar"]["target"]
+    asof_serial = _serial(job.extract["asofDate"])
+
+    # rate lookups for combo detection (read from the SOURCE workbook)
+    sku = _read_sheet_cols(src, "Commission Rate by SKUs", ["B", "E"], 2)
+    sku_rates = {str(v["B"]).strip(): v["E"] for v in sku.values()
+                 if v.get("B") is not None and isinstance(v.get("E"), (int, float))}
+    kev = _read_sheet_cols(src, "Kevin Hanks", ["R", "S"], 2)
+    kevin_rates = {str(v["R"]).strip(): v["S"] for v in kev.values()
+                   if v.get("R") is not None and isinstance(v.get("S"), (int, float))}
+    combos, undetermined = rd.distinct_combos(
+        prior_rows, main["ar"], main["sales"], sku_rates, kevin_rates)
+
+    built = rd.build_data_rows(prior_rows, main["ar"], main["sales"],
+                               asof_serial, prior_tab, cur_tab,
+                               "New Sales report", data_spec["earnedLabel"])
+    del main, prior_rows
+
+    # Compiled Data: current extent + existing combo list
+    cd = _read_sheet_cols(src, "Compiled Data", ["C", "E", "F", "G"], 5)
+    old_end = None
+    existing = set()
+    last_used = rd.CD_FIRST_DATA_ROW - 1
+    for rn, v in sorted(cd.items()):
+        f_g = None
+        if v.get("C") not in (None, ""):
+            last_used = max(last_used, rn)
+            if v.get("E") not in (None, "") and isinstance(v.get("F"), (int, float)):
+                existing.add((str(v["C"]), str(v["E"]), round(float(v["F"]), 6)))
+    with zipfile.ZipFile(src) as zf:
+        s0 = XlsxSurgeon(src, workdir=WORK)
+        cxml = zf.read(s0._sheet_parts["Compiled Data"]).decode()
+    m = re.search(r"Data!\$N\$11:\$N\$(\d+)", cxml)
+    if not m:
+        raise ValueError("Compiled Data: could not detect the Data range end")
+    old_end = int(m.group(1))
+    del cxml
+
+    # Only genuinely NEW (company, partner) pairs get rows. Rate-variant
+    # differences on pairs Compiled already lists are far more likely to be
+    # server-side rate-engine drift than real new business (rehearsal on
+    # June-vs-June produced 1,160 rate variants and 0 truly new pairs) —
+    # those are surfaced for review instead of written.
+    existing_pairs = {(c, p) for c, p, _r in existing}
+    new_combos = sorted(c for c in combos
+                        if c not in existing
+                        and (c[0], c[1]) not in existing_pairs)
+    rate_variants = sum(1 for c in combos if c not in existing
+                        and (c[0], c[1]) in existing_pairs)
+    # both pivot caches read Compiled C4:T3723 — appended rows must stay inside
+    room = 3700 - last_used
+    dropped_combos = max(0, len(new_combos) - max(room, 0))
+    new_combos = new_combos[:max(room, 0)]
+    j["compiledRateVariantsSkipped"] = rate_variants
+
+    mid2 = os.path.join(WORK, f"{job_id}_mid2.xlsx")
+    os.replace(dst, mid2)
+    s3 = XlsxSurgeon(mid2, workdir=WORK)
+    s3.paste_columns("Data", f"A{rd.DATA_FIRST_ROW}", built["pasteRows"],
+                     clear_beyond=True)
+    cells = dict(built["cells"])
+    cells.update(built["headerCells"])
+    s3.set_cells("Data", cells)
+    if old_end != built["lastRow"]:
+        s3.replace_formula_text("Compiled Data", [
+            {"from": f"${old_end}", "to": f"${built['lastRow']}"}])
+    if new_combos:
+        s3.set_cells("Compiled Data", rd.compiled_combo_rows(
+            new_combos, last_used + 1, built["lastRow"],
+            data_spec.get("monthTag", "")))
+    del built["pasteRows"], cells
+    results = s3.apply(dst)
+    del s3
+    for p in (p_main, p_prior, mid2):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    j.update(dataLastRow=built["lastRow"], dataBlocks=built["blocks"],
+             compiledRangeEnd=built["lastRow"],
+             compiledCombosAdded=len(new_combos),
+             compiledCombosDropped=dropped_combos,
+             compiledCombosUndetermined=sorted(undetermined)[:25])
+    return results
+
+
+def _build_statements_zip(job_id: str, src: str, spec: dict, j: dict) -> str:
+    """Per-rep statement files from a RECALCULATED workbook's cached values."""
+    import report_data as rd
+    with zipfile.ZipFile(src) as zf:
+        wb_xml = zf.read("xl/workbook.xml").decode()
+        if 'fullCalcOnLoad="1"' in wb_xml:
+            raise ValueError(
+                "this workbook has not been opened/recalculated in desktop "
+                "Excel since surgery — Compiled Data still carries stale "
+                "caches. Open it once, let the recalc finish, save, then "
+                "re-run statements.")
+    cd = _read_sheet_cols(src, "Compiled Data",
+                          ["C", "E", "F", "G", "H", "I", "J", "K", "L", "S"],
+                          rd.CD_FIRST_DATA_ROW)
+    compiled = []
+    for rn, v in sorted(cd.items()):
+        if v.get("C") in (None, "") or v.get("E") in (None, ""):
+            continue
+        num = lambda x: x if isinstance(x, (int, float)) else 0.0
+        compiled.append({
+            "company": v["C"], "partner": v["E"], "rate": v.get("F"),
+            "prior": num(v.get("G")), "newSales": num(v.get("H")),
+            "collections": num(v.get("I")) + num(v.get("J")),
+            "partial": num(v.get("K")), "totalColl": num(v.get("L")),
+            "earned": num(v.get("S")),
+        })
+    pay_rows = _read_sheet_cols(src, "Payment", ["E", "F", "G", "H", "I"], 6, 25)
+    payment = {}
+    for rn, v in pay_rows.items():
+        if v.get("E") in (None, "", "Grand Total"):
+            continue
+        num = lambda x: x if isinstance(x, (int, float)) else 0.0
+        payment[str(v["E"])] = {"earned": num(v.get("F")), "fee": num(v.get("G")),
+                                "adj": num(v.get("H")), "net": num(v.get("I"))}
+    files = rd.build_statements(compiled, payment,
+                                spec.get("periodLabel", "period"))
+    if not files:
+        raise ValueError("no partner had reportable activity — refusing to "
+                         "emit an empty statements zip")
+    zpath = os.path.join(WORK, f"{job_id}_statements.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, blob in sorted(files.items()):
+            z.writestr(name, blob)
+        z.writestr("manifest.json", json.dumps(
+            {"period": spec.get("periodLabel"), "count": len(files),
+             "files": sorted(files)}, indent=1))
+    j.update(statementCount=len(files), statementFiles=sorted(files))
+    return zpath
 
 
 def _run_read_ranges(path: str, specs: list[dict], j: dict) -> None:
@@ -708,6 +890,18 @@ def _run(job_id: str, job: Job):
         _mem_checkpoint(j, "download")
         _persist_jobs()
 
+        if job.statements:
+            # lean job: no surgery — read the recalced workbook, emit the
+            # per-rep statement files (SOP 'Reporting': one file per rep,
+            # distribution stays with Jennifer)
+            j["stage"] = "statements"
+            _persist_jobs()
+            zpath = _build_statements_zip(job_id, src, job.statements, j)
+            j.update(status="done", stage="complete", resultPath=zpath,
+                     recovery="GET /jobs/{id}/result returns the zip")
+            _persist_jobs()
+            return
+
         # fail on layout drift BEFORE spending 5 minutes on the extract —
         # a guard failure here is the job working as designed
         if job.headerGuard:
@@ -796,7 +990,26 @@ def _run(job_id: str, job: Job):
                          priorArOpenBalance=bal,
                          priorArClosedCount=hit,
                          priorArReport=preport)
+                if job.extract.get("dataTab"):
+                    import pickle
+                    with open(os.path.join(WORK, f"{job_id}_report_prior.pkl"),
+                              "wb") as pf:
+                        pickle.dump(prows, pf)
                 del close_map, prows, pops
+            # reporting half: stash the row-sets on DISK for phase 3 — the
+            # Data-tab ops (~46k rows + formula cells) are built only when
+            # that phase runs, so phases 1-2 never hold them in memory
+            data_spec = job.extract.get("dataTab")
+            if data_spec and job.extract.get("applyOps", True):
+                if not job.extract.get("priorAr"):
+                    raise ValueError("extract.dataTab requires extract.priorAr "
+                                     "— the Data tab's first block IS the "
+                                     "refreshed prior AR")
+                import pickle
+                with open(os.path.join(WORK, f"{job_id}_report_main.pkl"),
+                          "wb") as pf:
+                    pickle.dump({"ar": data["arRows"],
+                                 "sales": data["salesRows"]}, pf)
             # build_ops's _pad() already made independent copies of every
             # row into gen_ops (now merged into job.ops) — data["arRows"]/
             # data["salesRows"] (16k+ and 13.5k+ Python lists) are a
@@ -885,6 +1098,15 @@ def _run(job_id: str, job: Job):
             _mem_checkpoint(j, "before_apply")
             results = s.apply(dst)
             _mem_checkpoint(j, "after_apply")
+        # phase 3: the reporting half — Data tab regeneration + Compiled
+        # Data maintenance, on the phase-2 output with a fresh surgeon
+        data_spec = (job.extract or {}).get("dataTab") if job.extract else None
+        if data_spec and (job.extract or {}).get("applyOps", True):
+            j["stage"] = "reporting"
+            _persist_jobs()
+            results += _run_reporting_phase(job_id, job, data_spec, src, dst, j)
+            _mem_checkpoint(j, "reporting")
+
         j["opsResults"] = results
         j["outputMB"] = round(os.path.getsize(dst) / 1048576, 1)
         _persist_jobs()
@@ -958,7 +1180,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v32-parsefix"
+VERSION = "2026-08-21-v33-reporting"
 
 
 @app.get("/health")

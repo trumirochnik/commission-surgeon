@@ -582,6 +582,14 @@ class XlsxSurgeon:
                 elif pivot_reload and re.match(
                         r"xl/pivotCache/pivotCacheDefinition\d+\.xml$", name):
                     px = zin.read(name).decode("utf-8", "replace")
+                    ws_src = re.search(r"<worksheetSource[^>]*/>", px)
+                    if ws_src and "r:id=" in ws_src.group(0):
+                        # EXTERNAL-workbook source (the Sheet2 sales-history
+                        # pivot reads the AGA export file): refresh-on-open
+                        # would demand that file on the user's machine —
+                        # leave it on its cached records
+                        zout.writestr(name, px)
+                        continue
                     if 'refreshOnLoad="1"' not in px:
                         if "refreshOnLoad=" in px:
                             px2 = re.sub(r'refreshOnLoad="[^"]*"',
