@@ -901,7 +901,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v27-headerserials"
+VERSION = "2026-08-21-v28-lookupkey"
 
 
 @app.get("/health")

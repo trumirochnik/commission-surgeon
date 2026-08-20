@@ -736,12 +736,19 @@ FORMULA_TEMPLATES = {
                'VLOOKUP(I{r},\'Commission Rate by SKUs\'!B:E,4,0))))),0.1)'),
         "AB": "=IFERROR(L{r}*AA{r},0)",
         "AC": '=+CONCATENATE(H{r}," - ",I{r})',
-        "AD": ('=+IFERROR(IF(F{r}<$AD$4,_xlfn.XLOOKUP(AC{r},\'{prior_ar_tab}\'!AG:AG,'
+        # Lookup array is the prior tab's KEY column. June's own formula said
+        # AG:AG because MAY's legacy layout kept the concat key there (May row
+        # 6 header: AG = "Concatenation No. & ..."); June onward — and every
+        # tab THIS pipeline generates — the key is AC and AG holds the prior-
+        # balance XLOOKUP result. Copying AG:AG forward made 16,358/16,358
+        # lookups #N/A on the 0819-2103 run (keys matched against balances),
+        # IFERROR collapsed aged AD to 0, and AE=L-0 poisoned Dashboard H/E/J.
+        "AD": ('=+IFERROR(IF(F{r}<$AD$4,_xlfn.XLOOKUP(AC{r},\'{prior_ar_tab}\'!AC:AC,'
                "'{prior_ar_tab}'!L:L),IF(F{r}>$AD$4,V{r},\" \")),0)"),
         "AE": ('=IF(AND(U{r}="Kevin Hanks",Y{r}=" ")," ",'
                'IF(U{r}=""," ",IF(AD{r}<>" ",L{r}-AD{r}," ")))'),
         "AF": '=IF(ISNUMBER(MATCH(I{r},\'Commission Rate by SKUs\'!$B:$B,0)),"Licensed","Core")',
-        "AG": "=_xlfn.XLOOKUP(AC{r},'{prior_ar_tab}'!AG:AG,'{prior_ar_tab}'!L:L)",
+        "AG": "=_xlfn.XLOOKUP(AC{r},'{prior_ar_tab}'!AC:AC,'{prior_ar_tab}'!L:L)",
         "AH": "=L{r}-AG{r}",
     },
     "sales": {                     # New Sales report, columns Z:AH

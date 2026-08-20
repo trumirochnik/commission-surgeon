@@ -131,8 +131,8 @@ sg.duplicate_sheet("AR_06.30", "AR_07.31")
 sg.paste_columns("AR_07.31", "A7", [["july1"] + [None] * 23,
                                     ["july2"] + [None] * 23], True)
 sg.set_cells("AR_07.31", {
-    "AD7": "=_xlfn.XLOOKUP(AC7,'AR_06.30'!AG:AG,'AR_06.30'!L:L)",
-    "AD8": "=_xlfn.XLOOKUP(AC8,'AR_06.30'!AG:AG,'AR_06.30'!L:L)"})
+    "AD7": "=_xlfn.XLOOKUP(AC7,'AR_06.30'!AC:AC,'AR_06.30'!L:L)",
+    "AD8": "=_xlfn.XLOOKUP(AC8,'AR_06.30'!AC:AC,'AR_06.30'!L:L)"})
 sg.retarget_refs("AR_07.31", TWO_WAY)
 res = sg.apply(out1)
 dup = sheet_of(out1, "AR_07.31")
@@ -142,7 +142,7 @@ check("R2: L2 two-way shifted correctly (no cascade)",
       "'AR_06.30'!V4-'AR_07.31'!L3" in dup, dup[:500])
 check("R2b: header AD4 shifted May->June", "'AR_06.30'!$B$1" in dup)
 check("R2c: generated data formulas NOT shifted (still prior-month June)",
-      "_xlfn.XLOOKUP(AC7,'AR_06.30'!AG:AG" in dup.replace("&apos;", "'"), dup[-900:])
+      "_xlfn.XLOOKUP(AC7,'AR_06.30'!AC:AC" in dup.replace("&apos;", "'"), dup[-900:])
 rt = [r0 for r0 in res if r0["kind"] == "retarget_refs"]
 check("R3: per-mapping counts reported",
       rt and rt[0]["perMapping"].get("AR_05.31", 0) >= 1
