@@ -438,9 +438,7 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
     s3 = XlsxSurgeon(mid2, workdir=WORK)
     s3.paste_columns("Data", f"A{rd.DATA_FIRST_ROW}", built["pasteRows"],
                      clear_beyond=True)
-    cells = dict(built["cells"])
-    cells.update(built["headerCells"])
-    s3.set_cells("Data", cells)
+    s3.set_cells("Data", dict(built["headerCells"]))
     if old_end != built["lastRow"]:
         s3.replace_formula_text("Compiled Data", [
             {"from": f"${old_end}", "to": f"${built['lastRow']}"}])
@@ -448,7 +446,7 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
         s3.set_cells("Compiled Data", rd.compiled_combo_rows(
             new_combos, last_used + 1, built["lastRow"],
             data_spec.get("monthTag", "")))
-    del built["pasteRows"], cells
+    del built["pasteRows"]
     results = s3.apply(dst)
     del s3
     for p in (p_main, p_prior, mid2):
@@ -1147,12 +1145,25 @@ def _run(job_id: str, job: Job):
             results2 = s2.apply(dst)
             _mem_checkpoint(j, "after_apply_phase2")
             results = results1 + results2
+            # phase 2's surgeon and ops hold EVERY paste row (sales +
+            # refreshed prior + raw append, ~43k rows) — the 0820 evening
+            # OOM died entering phase 3 with all of that still resident
+            del s2
+            phase2_ops = None
+            import gc
+            gc.collect()
+            _mem_checkpoint(j, "after_phase2_release")
         else:
             s = XlsxSurgeon(src, workdir=WORK)
             _run_ops(s, phase1_ops)
             _mem_checkpoint(j, "before_apply")
             results = s.apply(dst)
             _mem_checkpoint(j, "after_apply")
+            del s
+            phase1_ops = None
+            job.ops = []
+            import gc
+            gc.collect()
         # phase 3: the reporting half — Data tab regeneration + Compiled
         # Data maintenance, on the phase-2 output with a fresh surgeon
         data_spec = (job.extract or {}).get("dataTab") if job.extract else None
@@ -1235,7 +1246,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v34-oneflow"
+VERSION = "2026-08-21-v35-memfit"
 
 
 @app.get("/health")

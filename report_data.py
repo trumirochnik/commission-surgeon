@@ -57,94 +57,125 @@ def _serial_month(t) -> int:
     return (EXCEL_EPOCH + dt.timedelta(days=int(t))).month
 
 
+# full-width row layout: A(0) DateBreak | B(1) Period | C..Z(2..25) data |
+# AA(26) Difference | AB(27) Deposit Month | AC(28) Client Age | AD(29)
+# Deposit Month # | AE(30) Rate | AF(31) Unearned | AG(32) Earned | AH(33)
+# unused | AI(34) key | AJ(35) prior open bal | AK(36) gross original |
+# AL(37) gross adjusted | AM(38) key2 | AN(39)/AO(40) left empty
+DATA_WIDTH = 39
+
+
 def build_data_rows(prior_rows: list[list], cur_rows: list[list],
                     sales_rows: list[list], asof_serial: int,
                     prior_tab: str, cur_tab: str, sales_tab: str,
                     earned_label: str) -> dict:
-    """-> {'pasteRows': [...26-wide A..Z...], 'cells': {ref: value|formula},
-          'lastRow': n, 'blocks': {...}, 'headerCells': {...}}
+    """-> {'pasteRows': [...full-width A..AM rows, formulas inline...],
+          'lastRow', 'blocks', 'headerCells'}.
 
-    pasteRows carry A..Z (A empty, B period label, C..Z data). Everything
-    from AA rightward goes through `cells` so formulas and per-block
-    divergence stay explicit."""
+    Formulas ride INSIDE the paste rows ('=' strings) — the first cut kept
+    them in a separate ~330k-entry {ref: formula} dict, and that dict plus
+    the paste rows plus phase 2's still-resident ops OOM'd the container
+    (0820 evening). CONSUMES the source lists (cleared block by block) so
+    peak memory is roughly the output alone."""
     paste: list[list] = []
-    cells: dict[str, object] = {}
     rn = DATA_FIRST_ROW
 
     def is_num(v):
         return isinstance(v, (int, float))
 
+    def base(label, vals24):
+        r = [None] * DATA_WIDTH
+        r[1] = label
+        r[2:2 + 24] = list(vals24[:24]) + [None] * (24 - len(vals24[:24]))
+        return r
+
     # ---- block 1: Prior Month ------------------------------------------
     blk1_first = rn
-    for i, row in enumerate(prior_rows):
-        src = 7 + i                      # tab data starts at row 7
-        paste.append([None, "Prior Month"] + list(row[:24]))
-        t = row[19]                      # verified Date Closed serial
+    n1 = len(prior_rows)
+    for i in range(n1):
+        row = prior_rows[i]
+        prior_rows[i] = None                    # consume as we go
+        src = 7 + i                             # tab data starts at row 7
+        r = base("Prior Month", row)
+        t = row[19]                             # verified Date Closed serial
         if is_num(t) and t <= asof_serial:
-            cells[f"AB{rn}"] = t         # SOP: future deposit months removed
-            cells[f"AD{rn}"] = _serial_month(t)
+            r[27] = t                           # SOP: future months removed
+            r[29] = _serial_month(t)
         else:
-            cells[f"AD{rn}"] = 0
+            r[29] = 0
         fs = row[3]
         if is_num(fs):
-            cells[f"AC{rn}"] = round((asof_serial - fs) / 365, 2)
-        cells[f"AE{rn}"] = f"='{prior_tab}'!AD{src}"    # rate
-        cells[f"AF{rn}"] = f"='{prior_tab}'!AE{src}"    # unearned
-        cells[f"AG{rn}"] = f"='{prior_tab}'!AF{src}"    # earned
-        cells[f"AI{rn}"] = f"=_xlfn.CONCAT(Z{rn},J{rn},K{rn})"
-        cells[f"AM{rn}"] = f'=_xlfn.CONCAT(J{rn}," - ",K{rn})'
+            r[28] = round((asof_serial - fs) / 365, 2)
+        r[30] = f"='{prior_tab}'!AD{src}"       # rate
+        r[31] = f"='{prior_tab}'!AE{src}"       # unearned
+        r[32] = f"='{prior_tab}'!AF{src}"       # earned
+        r[34] = f"=_xlfn.CONCAT(Z{rn},J{rn},K{rn})"
+        r[38] = f'=_xlfn.CONCAT(J{rn}," - ",K{rn})'
+        paste.append(r)
         rn += 1
+    prior_rows.clear()
     blk1_last = rn - 1
-    for _ in range(SPACER):              # paste is consecutive from the
-        paste.append([None] * 26)        # anchor — spacers must be real rows
-        rn += 1
+    for _ in range(SPACER):                     # paste is consecutive from
+        paste.append([None] * DATA_WIDTH)       # the anchor — spacers must
+        rn += 1                                 # be real rows
 
     # ---- block 2: Current Month ----------------------------------------
     blk2_first = rn
     aj_rng = f"$AI${blk1_first}:$AI${blk1_last}"
     aj_n = f"$N${blk1_first}:$N${blk1_last}"
-    for i, row in enumerate(cur_rows):
+    n2 = len(cur_rows)
+    for i in range(n2):
+        row = cur_rows[i]
+        cur_rows[i] = None
         src = 7 + i
-        paste.append([None, "Current Month"] + list(row[:24]))
-        cells[f"AA{rn}"] = f"=X{rn}-N{rn}"              # SOP: formula, not value
-        cells[f"AE{rn}"] = f"='{cur_tab}'!AA{src}"      # rate (June layout)
-        cells[f"AF{rn}"] = f"='{cur_tab}'!AB{src}"      # unearned
-        cells[f"AI{rn}"] = f"=_xlfn.CONCAT(Z{rn},J{rn},K{rn})"
-        cells[f"AJ{rn}"] = (f'=IF($B{rn}="Current Month",_xlfn.XLOOKUP('
-                            f'AI{rn},{aj_rng},{aj_n},"Error",0),0)')
-        gross = row[21]                                  # V Amount (Gross)
+        r = base("Current Month", row)
+        r[26] = f"=X{rn}-N{rn}"                 # SOP: formula, not value
+        r[30] = f"='{cur_tab}'!AA{src}"         # rate (June layout)
+        r[31] = f"='{cur_tab}'!AB{src}"         # unearned
+        r[34] = f"=_xlfn.CONCAT(Z{rn},J{rn},K{rn})"
+        r[35] = (f'=IF($B{rn}="Current Month",_xlfn.XLOOKUP('
+                 f'AI{rn},{aj_rng},{aj_n},"Error",0),0)')
+        gross = row[21]                         # V Amount (Gross)
         if gross is not None:
-            cells[f"AK{rn}"] = gross                     # Original, as VALUE
-        cells[f"AL{rn}"] = (f"=IF(AJ{rn}<0,IF(AJ{rn}>AK{rn},AJ{rn},"
-                            f"IF(AJ{rn}<AK{rn},AJ{rn},AK{rn})),"
-                            f"IF(AJ{rn}<AK{rn},AJ{rn},AK{rn}))")
-        cells[f"X{rn}"] = f"=AL{rn}"    # the paste-adjusted-over-gross step
-        cells[f"AM{rn}"] = f'=_xlfn.CONCAT(J{rn}," - ",K{rn})'
+            r[36] = gross                       # Original, as VALUE
+        r[37] = (f"=IF(AJ{rn}<0,IF(AJ{rn}>AK{rn},AJ{rn},"
+                 f"IF(AJ{rn}<AK{rn},AJ{rn},AK{rn})),"
+                 f"IF(AJ{rn}<AK{rn},AJ{rn},AK{rn}))")
+        r[23] = f"=AL{rn}"      # X: the paste-adjusted-over-gross step
+        r[38] = f'=_xlfn.CONCAT(J{rn}," - ",K{rn})'
+        paste.append(r)
         rn += 1
+    cur_rows.clear()
     blk2_last = rn - 1
     for _ in range(SPACER):
-        paste.append([None] * 26)
+        paste.append([None] * DATA_WIDTH)
         rn += 1
 
     # ---- block 3: New Sales --------------------------------------------
     blk3_first = rn
-    for i, row in enumerate(sales_rows):
+    n3 = len(sales_rows)
+    for i in range(n3):
+        row = sales_rows[i]
+        sales_rows[i] = None
         src = 7 + i
         r25 = list(row[:25]) + [None] * (25 - len(row[:25]))
-        paste.append([None, "New Sales"] + r25[:22] + [None, r25[24]])
-        cells[f"AB{rn}"] = f"='{sales_tab}'!AB{src}"    # deposit date (gated)
-        cells[f"AC{rn}"] = f"='{sales_tab}'!X{src}"     # client age
-        cells[f"AD{rn}"] = f"='{sales_tab}'!AC{src}"    # deposit month number
-        cells[f"AE{rn}"] = f"='{sales_tab}'!AD{src}"    # rate
-        cells[f"AF{rn}"] = f"='{sales_tab}'!AE{src}"    # unearned
-        cells[f"AG{rn}"] = f"='{sales_tab}'!AF{src}"    # earned
-        cells[f"AI{rn}"] = f"=_xlfn.CONCAT(Z{rn},J{rn},K{rn})"
-        cells[f"AM{rn}"] = f'=_xlfn.CONCAT(J{rn}," - ",K{rn})'
+        r = base("New Sales", r25[:22])
+        r[25] = r25[24]                         # Z <- sales Y (company)
+        r[27] = f"='{sales_tab}'!AB{src}"       # deposit date (gated)
+        r[28] = f"='{sales_tab}'!X{src}"        # client age
+        r[29] = f"='{sales_tab}'!AC{src}"       # deposit month number
+        r[30] = f"='{sales_tab}'!AD{src}"       # rate
+        r[31] = f"='{sales_tab}'!AE{src}"       # unearned
+        r[32] = f"='{sales_tab}'!AF{src}"       # earned
+        r[34] = f"=_xlfn.CONCAT(Z{rn},J{rn},K{rn})"
+        r[38] = f'=_xlfn.CONCAT(J{rn}," - ",K{rn})'
+        paste.append(r)
         rn += 1
+    sales_rows.clear()
     blk3_last = rn - 1
 
     return {
-        "pasteRows": paste, "cells": cells, "lastRow": blk3_last,
+        "pasteRows": paste, "lastRow": blk3_last,
         "blocks": {"prior": (blk1_first, blk1_last),
                    "current": (blk2_first, blk2_last),
                    "sales": (blk3_first, blk3_last)},

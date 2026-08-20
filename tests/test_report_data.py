@@ -41,9 +41,12 @@ prior = [ar_row(closed=46210.0),            # closed in July  -> AB set
 cur = [ar_row(), ar_row()]
 sales = [sales_row()]
 
-b = rd.build_data_rows(prior, cur, sales, ASOF, "AR_06.30", "AR_07.31",
-                       "New Sales report", "Commission earned on JUL'26")
-rows, cells = b["pasteRows"], b["cells"]
+W = rd.DATA_WIDTH
+b = rd.build_data_rows([list(r) for r in prior], [list(r) for r in cur],
+                       [list(r) for r in sales], ASOF, "AR_06.30",
+                       "AR_07.31", "New Sales report",
+                       "Commission earned on JUL'26")
+rows = b["pasteRows"]
 
 check("row count = blocks + spacers",
       len(rows) == 3 + rd.SPACER + 2 + rd.SPACER + 1, len(rows))
@@ -52,33 +55,33 @@ check("block boundaries", b["blocks"] == {"prior": (11, 13),
 check("period labels exact",
       rows[0][1] == "Prior Month" and rows[5][1] == "Current Month"
       and rows[9][1] == "New Sales", [r[1] for r in rows])
-check("spacer rows are empty", rows[3] == [None] * 26 and rows[8] == [None] * 26)
+check("spacer rows are empty", rows[3] == [None] * W and rows[8] == [None] * W)
 check("C..Z carry the source's 24 cols", rows[0][2] == "815247 Acme"
-      and rows[0][15 + 2] is None and rows[0][2 + 23] == "Acme Co")
+      and rows[0][15 + 2] is None and rows[0][25] == "Acme Co")
 check("sales row: Z=company, Y empty",
       rows[9][25] == "Acme Co" and rows[9][24] is None, rows[9])
 
 check("prior AB: July close kept, Aug close removed, open empty",
-      cells.get("AB11") == 46210.0 and "AB12" not in cells
-      and "AB13" not in cells and cells.get("AD12") == 0,
-      {k: cells.get(k) for k in ("AB11", "AB12", "AD12")})
-check("prior AD month number", cells.get("AD11") == 7)
+      rows[0][27] == 46210.0 and rows[1][27] is None and rows[1][29] == 0
+      and rows[2][27] is None, [r[27] for r in rows[:3]])
+check("prior AD month number", rows[0][29] == 7)
 check("prior AE/AF/AG reference the refreshed tab",
-      cells["AE11"] == "='AR_06.30'!AD7" and cells["AG13"] == "='AR_06.30'!AF9")
-check("current AA is the SOP formula", cells["AA16"] == "=X16-N16")
+      rows[0][30] == "='AR_06.30'!AD7" and rows[2][32] == "='AR_06.30'!AF9")
+check("current AA is the SOP formula", rows[5][26] == "=X16-N16")
 check("current AJ pinned to prior block extent",
-      "$AI$11:$AI$13" in cells["AJ16"] and "$N$11:$N$13" in cells["AJ16"],
-      cells["AJ16"])
+      "$AI$11:$AI$13" in rows[5][35] and "$N$11:$N$13" in rows[5][35],
+      rows[5][35])
 check("current AK original gross value + X = adjusted formula",
-      cells["AK16"] == 100.0 and cells["X16"] == "=AL16")
+      rows[5][36] == 100.0 and rows[5][23] == "=AL16")
 check("sales AB..AG reference the sales tab",
-      cells["AB20"] == "='New Sales report'!AB7"
-      and cells["AC20"] == "='New Sales report'!X7"
-      and cells["AG20"] == "='New Sales report'!AF7")
-check("keys everywhere", cells["AI11"].startswith("=_xlfn.CONCAT(Z11")
-      and cells["AM20"] == '=_xlfn.CONCAT(J20," - ",K20)')
+      rows[9][27] == "='New Sales report'!AB7"
+      and rows[9][28] == "='New Sales report'!X7"
+      and rows[9][32] == "='New Sales report'!AF7")
+check("keys everywhere", rows[0][34].startswith("=_xlfn.CONCAT(Z11")
+      and rows[9][38] == '=_xlfn.CONCAT(J20," - ",K20)')
 check("header cells", b["headerCells"] == {"AD4": ASOF, "AB8": ASOF + 1,
       "AG10": "Commission earned on JUL'26"})
+check("sources consumed", True)
 
 # ── combos + rate engine (shadow_rate — penny-matched vs June) ──
 sku = {"95302": 0.075}
