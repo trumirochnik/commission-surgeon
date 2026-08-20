@@ -926,8 +926,23 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
 # cutoff, J total 594k vs Mike's reconciled 0.
 # ──────────────────────────────────────────────────────────────────────
 
+# The June-layout Y tests AF{r}="Core"/"Licensed" — fine there, where AF is
+# the product type. In the PRIOR layout AF becomes EARNED, which chains
+# AF -> AE -> AD -> Y: a circular reference (Excel warned on open,
+# 0820 evening). Mike sidesteps it by flattening Y to values; we keep the
+# formula but substitute the AF tests with the product-type check AF-as-type
+# itself computes (MATCH against the SKU tab), which breaks the cycle with
+# identical logic.
+_LICENSED_TEST = "ISNUMBER(MATCH(I{r},'Commission Rate by SKUs'!$B:$B,0))"
+_PRIOR_Y = (FORMULA_TEMPLATES["ar"]["Y"]
+            .replace('AF{r}="Core"', f"NOT({_LICENSED_TEST})")
+            .replace('AF{r}="Licensed"', _LICENSED_TEST))
+assert 'AF{r}' not in _PRIOR_Y, "prior Y still references AF — cycle not broken"
+assert _PRIOR_Y != FORMULA_TEMPLATES["ar"]["Y"], \
+    "ar Y template changed shape — revisit the prior-layout substitution"
+
 PRIOR_FORMULA_TEMPLATES: dict[str, str] = {
-    "Y": FORMULA_TEMPLATES["ar"]["Y"],          # Contracted Rates (same stack)
+    "Y": _PRIOR_Y,                              # Contracted Rates, cycle-free
     "Z": "=V{r}-L{r}",                          # Difference
     "AD": FORMULA_TEMPLATES["ar"]["AA"],        # Commission Rate (same logic,
                                                 # prior layout keeps it at AD)
