@@ -163,6 +163,32 @@ def build_ops(data: dict, spec: dict, prior_ar_tab: str | None = None
     return ops, report
 
 
+def build_prior_ops(rows: list[list], spec: dict, asof_serial: int
+                    ) -> tuple[list[dict], dict]:
+    """Ops for the prior-tab refresh (see extract_prior_ar): re-paste the
+    prior month's AR data (24 cols, current Date Closed in T) and convert
+    the tab to the PRIOR LAYOUT — Y/Z/AD/AE/AF/AG formulas plus AA/AB/AC
+    values, and the $AB$4 future-month gate in the header (a row-4 cell,
+    which the streaming rebuild writes into the prefix). Rows past the new
+    extent are dropped by the stream — including the hand-paste's shifted
+    junk rows whose stale T values spuriously passed the receipt cutoff."""
+    from netsuite_extract import prior_formula_cells, prior_value_cells
+    target = spec["target"]
+    anchor = spec.get("anchor", "A7")
+    first = _anchor_row(anchor)
+    cells: dict[str, object] = {}
+    cells.update(prior_formula_cells(first, len(rows)))
+    cells.update(prior_value_cells(rows, first, asof_serial))
+    for ref, val in (spec.get("headerCells") or {}).items():
+        cells[ref] = val
+    ops = [
+        {"op": "paste_columns", "sheet": target, "anchor": anchor,
+         "rows": _pad(rows, AR_DATA_COLS), "clear_beyond": True},
+        {"op": "set_cells", "sheet": target, "cells": cells},
+    ]
+    return ops, {"rowCount": len(rows), "cellCount": len(cells)}
+
+
 def run_extract(spec: dict, log=print) -> dict:
     """Run the NetSuite extract described by the job's `extract` block."""
     url = spec.get("mcpUrl") or os.environ.get("NS_MCP_URL")
@@ -174,3 +200,18 @@ def run_extract(spec: dict, log=print) -> dict:
     mcp = Mcp(url, secret)
     return ns_extract(mcp, spec["asofDate"], spec["fromDate"], spec["toDate"],
                       sign_flip=spec.get("signFlip", True), log=log)
+
+
+def run_prior_extract(spec: dict, prior_spec: dict, log=print) -> dict:
+    """AR-only pull for the prior-tab refresh. `spec` is the job's extract
+    block (creds/flags), `prior_spec` its priorAr sub-block."""
+    from netsuite_extract import extract_prior_ar
+    url = spec.get("mcpUrl") or os.environ.get("NS_MCP_URL")
+    secret = os.environ.get("MCP_SHARED_SECRET")
+    if not url:
+        raise RuntimeError("NS_MCP_URL not set and no mcpUrl in the job")
+    if not secret:
+        raise RuntimeError("MCP_SHARED_SECRET not set on the service")
+    mcp = Mcp(url, secret)
+    return extract_prior_ar(mcp, prior_spec["asofDate"],
+                            sign_flip=spec.get("signFlip", True), log=log)

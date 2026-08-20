@@ -75,7 +75,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from surgeon import XlsxSurgeon
-from commission_job import run_extract, build_ops
+from commission_job import run_extract, build_ops, build_prior_ops, run_prior_extract
 import xlsx_read as xr
 
 try:
@@ -740,6 +740,28 @@ def _run(job_id: str, job: Job):
                 job.ops = list(job.ops) + gen_ops  # APPEND: duplicate_sheet must run first
             else:
                 j["opsSkipped"] = "extract.applyOps=false — extract verified, no pastes generated"
+            # prior-tab refresh (SOP step proven from the hand-built 06.2026
+            # file): re-pull the PRIOR month's AR as-of its month end — run
+            # now, so Date Closed carries this month's payments — and
+            # convert that tab to the prior layout. Without it the receipts
+            # term of Dashboard E is blind (measured: J 594k vs Mike's 0).
+            prior_spec = job.extract.get("priorAr")
+            if prior_spec and job.extract.get("applyOps", True):
+                from netsuite_extract import serial as _serial
+                pdata = run_prior_extract(job.extract, prior_spec, log=_log)
+                if pdata["arCount"] < 1000:
+                    raise ValueError(
+                        f"prior-AR refresh returned {pdata['arCount']} rows — "
+                        "refusing to overwrite the prior tab with that.")
+                pops, preport = build_prior_ops(
+                    pdata["arRows"], prior_spec,
+                    _serial(prior_spec["asofDate"]))
+                job.ops = list(job.ops) + pops
+                j.update(priorArRows=pdata["arCount"],
+                         priorArOpenBalance=pdata["arOpenBalance"],
+                         priorArClosedCount=pdata["closedCount"],
+                         priorArReport=preport)
+                del pdata, pops
             # build_ops's _pad() already made independent copies of every
             # row into gen_ops (now merged into job.ops) — data["arRows"]/
             # data["salesRows"] (16k+ and 13.5k+ Python lists) are a
@@ -901,7 +923,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v28-lookupkey"
+VERSION = "2026-08-21-v29-priorrefresh"
 
 
 @app.get("/health")

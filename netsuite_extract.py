@@ -736,19 +736,22 @@ FORMULA_TEMPLATES = {
                'VLOOKUP(I{r},\'Commission Rate by SKUs\'!B:E,4,0))))),0.1)'),
         "AB": "=IFERROR(L{r}*AA{r},0)",
         "AC": '=+CONCATENATE(H{r}," - ",I{r})',
-        # Lookup array is the prior tab's KEY column. June's own formula said
-        # AG:AG because MAY's legacy layout kept the concat key there (May row
-        # 6 header: AG = "Concatenation No. & ..."); June onward — and every
-        # tab THIS pipeline generates — the key is AC and AG holds the prior-
-        # balance XLOOKUP result. Copying AG:AG forward made 16,358/16,358
-        # lookups #N/A on the 0819-2103 run (keys matched against balances),
-        # IFERROR collapsed aged AD to 0, and AE=L-0 poisoned Dashboard H/E/J.
-        "AD": ('=+IFERROR(IF(F{r}<$AD$4,_xlfn.XLOOKUP(AC{r},\'{prior_ar_tab}\'!AC:AC,'
+        # Lookup array is the prior tab's AG column — correct because of the
+        # PRIOR-TAB REFRESH step (SOP, proven from the hand-built 06.2026
+        # file): when a month rotates to "prior", its tab is re-pulled as-of
+        # its month end WITH current payment info and converted to the
+        # prior layout, where AG = "Concatenation No. & Item" (the key),
+        # AE = unearned, AF = earned. Dashboard K/M/E and these lookups all
+        # read that layout. v28 briefly pointed this at AC:AC — that was
+        # only "right" for an UNREFRESHED prior tab, which is itself the
+        # bug; with the refresh in place (extract_prior_ar), AG:AG is the
+        # contract every month.
+        "AD": ('=+IFERROR(IF(F{r}<$AD$4,_xlfn.XLOOKUP(AC{r},\'{prior_ar_tab}\'!AG:AG,'
                "'{prior_ar_tab}'!L:L),IF(F{r}>$AD$4,V{r},\" \")),0)"),
         "AE": ('=IF(AND(U{r}="Kevin Hanks",Y{r}=" ")," ",'
                'IF(U{r}=""," ",IF(AD{r}<>" ",L{r}-AD{r}," ")))'),
         "AF": '=IF(ISNUMBER(MATCH(I{r},\'Commission Rate by SKUs\'!$B:$B,0)),"Licensed","Core")',
-        "AG": "=_xlfn.XLOOKUP(AC{r},'{prior_ar_tab}'!AC:AC,'{prior_ar_tab}'!L:L)",
+        "AG": "=_xlfn.XLOOKUP(AC{r},'{prior_ar_tab}'!AG:AG,'{prior_ar_tab}'!L:L)",
         "AH": "=L{r}-AG{r}",
     },
     "sales": {                     # New Sales report, columns Z:AH
@@ -900,6 +903,104 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
                         "partners": len(partners), "arAccounts": len(accounts),
                         "signFlip": sign_flip},
     }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# PRIOR-TAB REFRESH — the SOP step the hand-built 06.2026 file proved.
+#
+# When a month rotates to "prior", Mike re-pulls its AR aging (same as-of
+# date, but run DURING the following month, so `Date Closed` carries the
+# payment dates that have happened since) and the tab takes the PRIOR
+# LAYOUT (May row-6 headers): Y Contracted Rates, Z Difference,
+# AA Deposit Month ('Jun26'), AB Client Age, AC Deposit Month(In number),
+# AD Commission Rate, AE Unearned (=L*AD), AF Commission earned on
+# receipts (=AE unless AC=$AB$4 future-month or 0 not-deposited),
+# AG Concatenation No. & Item (the lookup key), AH left alone.
+#
+# Everything downstream depends on this refresh: Dashboard E's receipts
+# term sums prior L where T (Date Closed) < the period cutoff; K sums
+# prior AE; M sums prior AF; and the current tab's AD/AG XLOOKUPs key on
+# prior AG. A FROZEN prior tab (what the pipeline shipped before this
+# existed) leaves T stale — measured on 0820-1803: receipts mostly
+# invisible, 12,506 column-shift junk values in T spuriously passing the
+# cutoff, J total 594k vs Mike's reconciled 0.
+# ──────────────────────────────────────────────────────────────────────
+
+PRIOR_FORMULA_TEMPLATES: dict[str, str] = {
+    "Y": FORMULA_TEMPLATES["ar"]["Y"],          # Contracted Rates (same stack)
+    "Z": "=V{r}-L{r}",                          # Difference
+    "AD": FORMULA_TEMPLATES["ar"]["AA"],        # Commission Rate (same logic,
+                                                # prior layout keeps it at AD)
+    "AE": "=IFERROR(L{r}*AD{r},0)",             # Unearned
+    "AF": '=IFERROR(IF(OR(AC{r}=$AB$4,AC{r}=0)," ",AE{r}),"0")',   # Earned
+    "AG": '=+CONCATENATE(H{r}," - ",I{r})',     # the key the NEXT month looks up
+}
+
+
+def prior_formula_cells(first_row: int, count: int) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for rn in range(first_row, first_row + count):
+        for col, tpl in PRIOR_FORMULA_TEMPLATES.items():
+            out[f"{col}{rn}"] = tpl.replace("{r}", str(rn))
+    return out
+
+
+def prior_value_cells(ar_rows: list[list], first_row: int,
+                      asof_serial: int) -> dict[str, object]:
+    """AA (deposit month label 'Jun26'), AB (client age in years),
+    AC (deposit month number; 0 = not yet deposited) — plain VALUES, the
+    way the hand-built prior tabs carry them. Derived from the row's own
+    Date Closed (col T, index 19) and First Sale Date (col D, index 3)."""
+    out: dict[str, object] = {}
+    for i, row in enumerate(ar_rows):
+        rn = first_row + i
+        t = row[19]
+        if isinstance(t, (int, float)):
+            d = EXCEL_EPOCH + dt.timedelta(days=int(t))
+            out[f"AA{rn}"] = f"{_MON3[d.month - 1]}{d.year % 100}"
+            out[f"AC{rn}"] = d.month
+        else:
+            out[f"AC{rn}"] = 0
+        first_sale = row[3]
+        fs = serial(first_sale) if not isinstance(first_sale, (int, float)) \
+            else first_sale
+        if isinstance(fs, (int, float)):
+            out[f"AB{rn}"] = round((asof_serial - fs) / 365, 2)
+    return out
+
+
+def extract_prior_ar(mcp: Mcp, asof: str, sign_flip: bool = True,
+                     log=print) -> dict:
+    """AR-only extract for the prior-tab refresh: open at `asof`, pulled
+    NOW, so closedate (col T) reflects payments made since. Same query,
+    same filters, same 24-column layout as the main AR extract."""
+    log(f"[priorAr] querying open-at-{asof} (with current Date Closed)")
+    ar_raw = mcp.rows(q_ar(asof), "prior AR aging")
+    log(f"[priorAr] {len(ar_raw)} raw lines")
+
+    ent_ids = sorted({str(g(r, 15)) for r in ar_raw if g(r, 15)})
+    item_ids = sorted({str(g(r, 5)) for r in ar_raw if g(r, 5)})
+    txn_ids = sorted({str(g(r, 14)) for r in ar_raw if g(r, 14)})
+    states = fetch_states(mcp, txn_ids)
+    partners = fetch_partners(mcp)
+    accounts = fetch_accounts(mcp, txn_ids)
+    cust = fetch_customers(mcp, ent_ids)
+    items: dict[str, str] = {}
+    for batch in chunks(item_ids, CUST_BATCH):
+        for r in mcp.rows(q_items(batch), "prior item dim"):
+            desc = g(r, 2)
+            if desc:
+                items[str(g(r, 1))] = re.sub(r"\s+", " ", str(desc)).strip()
+
+    rows, diag = build_ar_rows(ar_raw, cust, items, states, partners,
+                               accounts, sign_flip)
+    total = sum(r[11] for r in rows if isinstance(r[11], float))
+    closed = sum(1 for r in rows if isinstance(r[19], (int, float)))
+    log(f"[priorAr] {len(rows)} rows, open balance {round(total, 2)}, "
+        f"{closed} with a Date Closed")
+    return {"arRows": rows, "arCount": len(rows),
+            "arOpenBalance": round(total, 2), "closedCount": closed,
+            "diagnostics": diag}
 
 
 def main() -> int:

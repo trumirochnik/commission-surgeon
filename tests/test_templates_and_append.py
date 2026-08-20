@@ -26,10 +26,10 @@ except ValueError as e:
 # ── T2: with prior_ar_tab, AD/AG resolve to the real tab, not AR_05.31 ──
 cells = formula_cells("ar", 7, 1, prior_ar_tab="AR_06.30")
 check("T2a: AD7 references the real prior tab",
-      "'AR_06.30'!AC:AC" in cells["AD7"] and "AR_05.31" not in cells["AD7"],
+      "'AR_06.30'!AG:AG" in cells["AD7"] and "AR_05.31" not in cells["AD7"],
       cells["AD7"])
 check("T2b: AG7 references the real prior tab",
-      "'AR_06.30'!AC:AC" in cells["AG7"] and "AR_05.31" not in cells["AG7"],
+      "'AR_06.30'!AG:AG" in cells["AG7"] and "AR_05.31" not in cells["AG7"],
       cells["AG7"])
 check("T2c: no leftover {r} or {prior_ar_tab} placeholders anywhere",
       all("{r}" not in v and "{prior_ar_tab}" not in v for v in cells.values()),
