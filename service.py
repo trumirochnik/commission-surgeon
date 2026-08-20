@@ -281,6 +281,31 @@ def _run_header_guard(src: str, guards: list[dict], ops: list[dict]) -> list[dic
     return report
 
 
+def _read_prior_rows(path: str, sheet: str, first_row: int) -> list[list]:
+    """The prior tab's data rows (A:X, 24 cols) exactly as pasted — the
+    as-of balances Mike closed the month on are ground truth for the
+    refresh; only Date Closed gets overwritten (see enrich_prior_rows).
+    Streams the part and resolves only the shared strings those rows use."""
+    s = XlsxSurgeon(path, workdir=WORK)
+    part = s._sheet_parts.get(sheet)
+    if not part:
+        raise ValueError(f"prior tab {sheet!r} not found in the workbook")
+    cols = [xr.col_letter(i) for i in range(1, 25)]
+    with zipfile.ZipFile(path) as zf:
+        rows = xr.stream_rows(zf, part, first_row, 10 ** 7)
+        need = set()
+        for rc in rows.values():
+            need |= xr.shared_indices(rc.values())
+        shared = xr.resolve_shared(zf, need)
+    out = []
+    for rn in sorted(rows):
+        rc = rows[rn]
+        vals = [xr.cell_value(rc.get(c), shared) for c in cols]
+        if any(v is not None and v != "" for v in vals):
+            out.append(vals)
+    return out
+
+
 def _run_read_ranges(path: str, specs: list[dict], j: dict) -> None:
     """Read requested ranges from the FINISHED output (after ops), resolving
     shared strings, and expose them keyed by their 'as' names. Values are
@@ -747,21 +772,31 @@ def _run(job_id: str, job: Job):
             # term of Dashboard E is blind (measured: J 594k vs Mike's 0).
             prior_spec = job.extract.get("priorAr")
             if prior_spec and job.extract.get("applyOps", True):
-                from netsuite_extract import serial as _serial
-                pdata = run_prior_extract(job.extract, prior_spec, log=_log)
-                if pdata["arCount"] < 1000:
+                from netsuite_extract import serial as _serial, enrich_prior_rows
+                close_map = run_prior_extract(job.extract, prior_spec, log=_log)
+                if len(close_map) < 100:
                     raise ValueError(
-                        f"prior-AR refresh returned {pdata['arCount']} rows — "
-                        "refusing to overwrite the prior tab with that.")
+                        f"prior-AR refresh: only {len(close_map)} close dates "
+                        "came back — refusing to blank the tab's Date Closed "
+                        "column against that.")
+                first = int(re.search(r"(\d+)$",
+                                      prior_spec.get("anchor", "A7")).group(1))
+                prows = _read_prior_rows(src, prior_spec["target"], first)
+                if len(prows) < 1000:
+                    raise ValueError(
+                        f"prior tab read back only {len(prows)} rows — "
+                        "refusing to rewrite it.")
+                hit = enrich_prior_rows(prows, close_map)
+                bal = round(sum(r[11] for r in prows
+                                if isinstance(r[11], (int, float))), 2)
                 pops, preport = build_prior_ops(
-                    pdata["arRows"], prior_spec,
-                    _serial(prior_spec["asofDate"]))
+                    prows, prior_spec, _serial(prior_spec["asofDate"]))
                 job.ops = list(job.ops) + pops
-                j.update(priorArRows=pdata["arCount"],
-                         priorArOpenBalance=pdata["arOpenBalance"],
-                         priorArClosedCount=pdata["closedCount"],
+                j.update(priorArRows=len(prows),
+                         priorArOpenBalance=bal,
+                         priorArClosedCount=hit,
                          priorArReport=preport)
-                del pdata, pops
+                del close_map, prows, pops
             # build_ops's _pad() already made independent copies of every
             # row into gen_ops (now merged into job.ops) — data["arRows"]/
             # data["salesRows"] (16k+ and 13.5k+ Python lists) are a
@@ -923,7 +958,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v29-priorrefresh"
+VERSION = "2026-08-21-v30-priorenrich"
 
 
 @app.get("/health")

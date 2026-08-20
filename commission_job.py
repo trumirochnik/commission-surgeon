@@ -202,10 +202,11 @@ def run_extract(spec: dict, log=print) -> dict:
                       sign_flip=spec.get("signFlip", True), log=log)
 
 
-def run_prior_extract(spec: dict, prior_spec: dict, log=print) -> dict:
-    """AR-only pull for the prior-tab refresh. `spec` is the job's extract
-    block (creds/flags), `prior_spec` its priorAr sub-block."""
-    from netsuite_extract import extract_prior_ar
+def run_prior_extract(spec: dict, prior_spec: dict, log=print) -> dict[str, int]:
+    """Close-date map for the prior-tab refresh (enrichment, not re-pull —
+    see fetch_prior_closedates). `spec` is the job's extract block
+    (creds/flags), `prior_spec` its priorAr sub-block."""
+    from netsuite_extract import fetch_prior_closedates
     url = spec.get("mcpUrl") or os.environ.get("NS_MCP_URL")
     secret = os.environ.get("MCP_SHARED_SECRET")
     if not url:
@@ -213,5 +214,4 @@ def run_prior_extract(spec: dict, prior_spec: dict, log=print) -> dict:
     if not secret:
         raise RuntimeError("MCP_SHARED_SECRET not set on the service")
     mcp = Mcp(url, secret)
-    return extract_prior_ar(mcp, prior_spec["asofDate"],
-                            sign_flip=spec.get("signFlip", True), log=log)
+    return fetch_prior_closedates(mcp, prior_spec["asofDate"], log=log)

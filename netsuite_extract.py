@@ -969,38 +969,53 @@ def prior_value_cells(ar_rows: list[list], first_row: int,
     return out
 
 
-def extract_prior_ar(mcp: Mcp, asof: str, sign_flip: bool = True,
-                     log=print) -> dict:
-    """AR-only extract for the prior-tab refresh: open at `asof`, pulled
-    NOW, so closedate (col T) reflects payments made since. Same query,
-    same filters, same 24-column layout as the main AR extract."""
-    log(f"[priorAr] querying open-at-{asof} (with current Date Closed)")
-    ar_raw = mcp.rows(q_ar(asof), "prior AR aging")
-    log(f"[priorAr] {len(ar_raw)} raw lines")
+def norm_docno(v) -> str | None:
+    """'726770', 726770.0 and ' 726770 ' must all key the same."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
 
-    ent_ids = sorted({str(g(r, 15)) for r in ar_raw if g(r, 15)})
-    item_ids = sorted({str(g(r, 5)) for r in ar_raw if g(r, 5)})
-    txn_ids = sorted({str(g(r, 14)) for r in ar_raw if g(r, 14)})
-    states = fetch_states(mcp, txn_ids)
-    partners = fetch_partners(mcp)
-    accounts = fetch_accounts(mcp, txn_ids)
-    cust = fetch_customers(mcp, ent_ids)
-    items: dict[str, str] = {}
-    for batch in chunks(item_ids, CUST_BATCH):
-        for r in mcp.rows(q_items(batch), "prior item dim"):
-            desc = g(r, 2)
-            if desc:
-                items[str(g(r, 1))] = re.sub(r"\s+", " ", str(desc)).strip()
 
-    rows, diag = build_ar_rows(ar_raw, cust, items, states, partners,
-                               accounts, sign_flip)
-    total = sum(r[11] for r in rows if isinstance(r[11], float))
-    closed = sum(1 for r in rows if isinstance(r[19], (int, float)))
-    log(f"[priorAr] {len(rows)} rows, open balance {round(total, 2)}, "
-        f"{closed} with a Date Closed")
-    return {"arRows": rows, "arCount": len(rows),
-            "arOpenBalance": round(total, 2), "closedCount": closed,
-            "diagnostics": diag}
+def fetch_prior_closedates(mcp: Mcp, asof: str, log=print) -> dict[str, int]:
+    """{document 'No.' -> Date Closed serial} for every invoice open at
+    `asof`, evaluated NOW — the enrichment feed for the prior-tab refresh.
+
+    Deliberately NOT a data re-pull: the tab's pasted L values (the as-of
+    balances Mike closed the month on) stay untouched as ground truth.
+    v29 replaced them with q_ar's reconstructed as-of balance and the
+    total came back 1.02M against the tab's 1.78M — the postpay CTE
+    under-reconstructs once weeks of payments separate the run from the
+    as-of date. Mike's own refreshed tabs keep the historical balances
+    (his May tab: closed rows still carry May-31 L) and only gain the
+    close dates, so that's the contract."""
+    log(f"[priorAr] pulling Date Closed for invoices open at {asof}")
+    raw = mcp.rows(q_ar(asof), "prior AR close dates")
+    out: dict[str, int] = {}
+    for r in raw:
+        key = norm_docno(g(r, 4))
+        cs = serial(g(r, 12))
+        if key and isinstance(cs, int):
+            out[key] = cs
+    log(f"[priorAr] {len(raw)} lines -> {len(out)} documents with a close date")
+    return out
+
+
+def enrich_prior_rows(rows: list[list], close_map: dict[str, int]) -> int:
+    """Overwrite each existing row's T (col 20, 'Date Closed') with the
+    VERIFIED close serial for its document number (col H), or clear it.
+    Clearing is load-bearing: the hand-pasted June tab carries 12,506
+    column-shift junk values in T (52, 60 — terms days) that spuriously
+    pass Dashboard E's '<serial' receipt cutoff. After this, T holds only
+    NetSuite-confirmed close dates. Returns the matched-row count."""
+    hit = 0
+    for row in rows:
+        cs = close_map.get(norm_docno(row[7]) or "")
+        row[19] = cs
+        if cs is not None:
+            hit += 1
+    return hit
 
 
 def main() -> int:
