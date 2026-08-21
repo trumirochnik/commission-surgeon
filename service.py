@@ -445,6 +445,14 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
         # July's partial-payment rows replace June's hand rows (headers in
         # rows 1-3 survive; clear_beyond drops the stale remainder)
         s3.paste_columns("Partial Payments", "A4", pp_rows, clear_beyond=True)
+    # Summary Pivot's accrual tie (P = N - O) reads a hand-pasted T/U side
+    # table that held the PRIOR month's ending balances (P was off by
+    # 7,274.75 on 0821-1646). Live XLOOKUPs into Dashboard W compute the
+    # same thing Mike pastes and keep the tie honest every month.
+    s3.set_cells("Summary Pivot", {
+        f"U{r}": (f"=IFERROR(_xlfn.XLOOKUP(T{r},Dashboard!$B$6:$B$24,"
+                  f"Dashboard!$W$6:$W$24,0,0),0)")
+        for r in range(4, 23)})
     if old_end != built["lastRow"]:
         s3.replace_formula_text("Compiled Data", [
             {"from": f"${old_end}", "to": f"${built['lastRow']}"}])
@@ -1314,7 +1322,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v39-partials"
+VERSION = "2026-08-21-v40-truerates"
 
 
 @app.get("/health")

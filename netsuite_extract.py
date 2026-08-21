@@ -538,6 +538,19 @@ def _dim_lookup(cust: dict | None, key: str) -> Any:
     return cust.get(key) if cust else None
 
 
+
+def id_num(v):
+    """Doc numbers and item ids as NUMBERS when they are numeric — Mike's
+    pasted tabs store them numeric, and the workbook's own VLOOKUP/MATCH
+    against 'Commission Rate by SKUs' (and the H>threshold contracted-rate
+    branches) are type-sensitive: our TEXT ids made VLOOKUP miss and the
+    IFERROR default 10% override the contracted 7.5% on ~5,000 rows
+    (found 0821, row-level diff of workbook AA vs the shadow engine)."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    return int(s) if s.isdigit() else v
+
 def build_ar_rows(raw: list[dict], cust: dict[str, dict],
                   items: dict[str, str], states: dict[str, str],
                   partners: dict[str, str], accounts: dict[str, str],
@@ -594,8 +607,8 @@ def build_ar_rows(raw: list[dict], cust: dict[str, dict],
             _dim_lookup(c, "store_type"),
             serial(g(r, 2)),
             g(r, 3),
-            g(r, 4),
-            item_id,
+            id_num(g(r, 4)),
+            id_num(item_id),
             items.get(str(item_id), item_id),
             qty * sf if isinstance(qty, float) else qty,
             bal * sf if isinstance(bal, float) else bal,
@@ -666,8 +679,8 @@ def build_sales_rows(raw: list[dict], cust: dict[str, dict],
             _dim_lookup(c, "store_type"),
             serial(g(r, 2)),
             g(r, 3),
-            g(r, 4),
-            item_id,
+            id_num(g(r, 4)),
+            id_num(item_id),
             items.get(str(item_id), item_id),
             qty * sf if isinstance(qty, float) else qty,
             amt * sf if isinstance(amt, float) else amt,

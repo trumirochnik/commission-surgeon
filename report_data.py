@@ -352,8 +352,18 @@ def shadow_compiled(prior_rows, cur_rows, sales_rows, asof_serial: int,
     """Compiled Data rows 5+ recomputed: per (company, partner, rate) —
     G prior, H new sales, I/J collections (Compiled's negative-sum sign),
     K partial payments, L total collections, S earned = L*rate."""
+    def _idtxt(v):
+        """726770, 726770.0 and '726770' must key identically — prior rows
+        read from the tab arrive as floats while extract rows are ints/
+        strings, and Excel's CONCAT renders all three the same way. The
+        mismatched f-string keys silently broke every prior-balance lookup
+        on real runs (found 0821 via the Brian L-residual decomposition)."""
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return "" if v is None else str(v).strip()
+
     def key_of(row):
-        return f"{row[23]}{row[7]}{row[8]}"          # CONCAT(Z, J, K)
+        return f"{_idtxt(row[23])}{_idtxt(row[7])}{_idtxt(row[8])}"
 
     prior_bal = {}
     for row in prior_rows:
@@ -388,7 +398,7 @@ def shadow_compiled(prior_rows, cur_rows, sales_rows, asof_serial: int,
             continue
         n = row[11] if isinstance(row[11], (int, float)) else 0.0
         ak = row[21] if isinstance(row[21], (int, float)) else 0.0
-        aj = prior_bal.get(f"{company}{row[7]}{row[8]}")
+        aj = prior_bal.get(key_of(row))
         if not isinstance(aj, (int, float)):
             al = ak                                   # XLOOKUP 'Error' path
         elif aj < 0:
