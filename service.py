@@ -1009,7 +1009,29 @@ def _run(job_id: str, job: Job):
                     f"extract returned {data['arCount']} AR / {data['salesCount']} sales "
                     "rows — refusing to write. Expected ~16,000 / ~13,500.")
             if job.extract.get("applyOps", True):
-                job.ops = list(job.ops) + gen_ops  # APPEND: duplicate_sheet must run first
+                # SPILL the generated ops to disk, partitioned by the pass
+                # that will run them. Holding every sheet's paste rows in
+                # job.ops from extract to the end of surgery kept ~46k rows
+                # resident (~350MB) and two runs OOM'd at the raw stage on
+                # top of that plateau (0820 evening + 0821 morning). Each
+                # pass now loads only its own rows.
+                import pickle
+                _ar_t = (job.extract.get("ar") or {}).get("target")
+                spill = {"p1": [], "sales": [], "raw": []}
+                for op in gen_ops:
+                    if op["op"] == "append_rows":
+                        spill["raw"].append(op)
+                    elif op.get("sheet") == _ar_t:
+                        spill["p1"].append(op)
+                    else:
+                        spill["sales"].append(op)
+                for name, lst in spill.items():
+                    if lst:
+                        with open(os.path.join(WORK, f"{job_id}_ops_{name}.pkl"),
+                                  "wb") as pf:
+                            pickle.dump(lst, pf)
+                del spill
+                j["opsSpilled"] = True
             else:
                 j["opsSkipped"] = "extract.applyOps=false — extract verified, no pastes generated"
             # prior-tab refresh (SOP step proven from the hand-built 06.2026
@@ -1038,7 +1060,11 @@ def _run(job_id: str, job: Job):
                                 if isinstance(r[11], (int, float))), 2)
                 pops, preport = build_prior_ops(
                     prows, prior_spec, _serial(prior_spec["asofDate"]))
-                job.ops = list(job.ops) + pops
+                import pickle
+                with open(os.path.join(WORK, f"{job_id}_ops_prior.pkl"),
+                          "wb") as pf:
+                    pickle.dump(pops, pf)
+                j["opsSpilled"] = True
                 j.update(priorArRows=len(prows),
                          priorArOpenBalance=bal,
                          priorArClosedCount=hit,
@@ -1090,14 +1116,6 @@ def _run(job_id: str, job: Job):
         # before phase 2 begins — the two phases' peaks never overlap. The
         # extra round-trip is local disk I/O (fast), not network.
         ar_target = ((job.extract or {}).get("ar") or {}).get("target")
-        phase1_ops, phase2_ops = list(job.ops), []
-        if ar_target:
-            phase1_ops, phase2_ops = [], []
-            for op in job.ops:
-                is_ar_or_dash = (
-                    (op["op"] == "duplicate_sheet" and op.get("name") == ar_target)
-                    or op.get("sheet") in (ar_target, "Dashboard"))
-                (phase1_ops if is_ar_or_dash else phase2_ops).append(op)
 
         def _run_ops(surgeon, ops):
             for op in ops:
@@ -1124,43 +1142,81 @@ def _run(job_id: str, job: Job):
                 else:
                     raise ValueError(f"unknown op {kind!r}")
 
-        if phase2_ops:
-            s1 = XlsxSurgeon(src, workdir=WORK)
-            _run_ops(s1, phase1_ops)
-            _mem_checkpoint(j, "before_apply_phase1")
-            results1 = s1.apply(mid)
-            _mem_checkpoint(j, "after_apply_phase1")
-            # ensure phase 1's surgeon, its queued ops, AND the AR paste
-            # rows/formula dicts (the bulk of the ~186MB pre-surgery
-            # baseline) are all collectible before phase 2 begins
-            del s1
-            phase1_ops = None
+        if j.get("opsSpilled"):
+            # ONE SHEET PER PASS, ops loaded lazily from the spill files —
+            # each pass holds only its own rows (~40-80MB) instead of the
+            # ~350MB every-sheet plateau that OOM'd two runs at the raw
+            # stage. Caller ops are partitioned by target; pivot stamping
+            # and anything unrecognized ride the final pass.
+            import gc
+            import pickle
+            sales_target = ((job.extract or {}).get("sales") or {}).get("target")
+            caller_p1, caller_sales, caller_last = [], [], []
+            for op in job.ops:
+                if op["op"] == "pivot_refresh_on_load":
+                    caller_last.append(op)
+                elif ((op["op"] == "duplicate_sheet" and op.get("name") == ar_target)
+                        or op.get("sheet") in (ar_target, "Dashboard")):
+                    caller_p1.append(op)
+                elif op.get("sheet") == sales_target:
+                    caller_sales.append(op)
+                else:
+                    caller_last.append(op)
             job.ops = []
-            import gc
+
+            def _spill_path(name):
+                return os.path.join(WORK, f"{job_id}_ops_{name}.pkl")
+
+            def _load_spill(name):
+                p = _spill_path(name)
+                if not os.path.exists(p):
+                    return []
+                with open(p, "rb") as f:
+                    lst = pickle.load(f)
+                os.remove(p)
+                return lst
+
+            PASSES = [
+                ("ar_dashboard", lambda: caller_p1 + _load_spill("p1")),
+                ("sales", lambda: caller_sales + _load_spill("sales")),
+                ("prior_refresh", lambda: _load_spill("prior")),
+                ("raw_final", lambda: _load_spill("raw") + caller_last),
+            ]
+            has = {
+                "ar_dashboard": bool(caller_p1) or os.path.exists(_spill_path("p1")),
+                "sales": bool(caller_sales) or os.path.exists(_spill_path("sales")),
+                "prior_refresh": os.path.exists(_spill_path("prior")),
+                "raw_final": bool(caller_last) or os.path.exists(_spill_path("raw")),
+            }
+            labels = [lb for lb, _fn in PASSES if has[lb]]
+            results = []
+            cur_in = src
+            for idx, (label, fn) in enumerate(p for p in PASSES if has[p[0]]):
+                out = dst if idx == len(labels) - 1 else \
+                    os.path.join(WORK, f"{job_id}_pass{idx}.xlsx")
+                lst = fn()
+                sgn = XlsxSurgeon(cur_in, workdir=WORK)
+                _run_ops(sgn, lst)
+                _mem_checkpoint(j, f"before_{label}")
+                results += sgn.apply(out)
+                _mem_checkpoint(j, f"after_{label}")
+                del sgn, lst
+                gc.collect()
+                if cur_in != src:
+                    try:
+                        os.remove(cur_in)
+                    except OSError:
+                        pass
+                cur_in = out
+            caller_p1 = caller_sales = caller_last = None
             gc.collect()
-            _mem_checkpoint(j, "after_phase1_release")
-            s2 = XlsxSurgeon(mid, workdir=WORK)   # fresh read from the intermediate
-            _run_ops(s2, phase2_ops)
-            _mem_checkpoint(j, "before_apply_phase2")
-            results2 = s2.apply(dst)
-            _mem_checkpoint(j, "after_apply_phase2")
-            results = results1 + results2
-            # phase 2's surgeon and ops hold EVERY paste row (sales +
-            # refreshed prior + raw append, ~43k rows) — the 0820 evening
-            # OOM died entering phase 3 with all of that still resident
-            del s2
-            phase2_ops = None
-            import gc
-            gc.collect()
-            _mem_checkpoint(j, "after_phase2_release")
         else:
             s = XlsxSurgeon(src, workdir=WORK)
-            _run_ops(s, phase1_ops)
+            _run_ops(s, list(job.ops))
             _mem_checkpoint(j, "before_apply")
             results = s.apply(dst)
             _mem_checkpoint(j, "after_apply")
             del s
-            phase1_ops = None
             job.ops = []
             import gc
             gc.collect()
@@ -1236,7 +1292,13 @@ def _run(job_id: str, job: Job):
                 j["recovery"] = ("output kept — POST /jobs/{id}/retry-upload "
                                  "with a fresh uploadUrl to finish without "
                                  "redoing the extract/surgery")
-        for p in (src, dst, mid):
+        # spill/pass/report leftovers from a failed run
+        import glob as _glob
+        leftovers = (_glob.glob(os.path.join(WORK, f"{job_id}_ops_*.pkl"))
+                     + _glob.glob(os.path.join(WORK, f"{job_id}_pass*.xlsx"))
+                     + _glob.glob(os.path.join(WORK, f"{job_id}_report_*.pkl"))
+                     + _glob.glob(os.path.join(WORK, f"{job_id}_mid2.xlsx")))
+        for p in leftovers + [src, dst, mid]:
             if p in keep:
                 continue
             try:
@@ -1246,7 +1308,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v35-memfit"
+VERSION = "2026-08-21-v36-passes"
 
 
 @app.get("/health")
