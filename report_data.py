@@ -532,14 +532,16 @@ def build_statements(compiled: list[dict], payment: dict[str, dict],
                 continue
             rows.append([
                 r["company"],
-                None if kevin or r.get("rate") in (None, "") else r["rate"],
+                # cell_xml drops None/"" cells entirely, which would shift
+                # the row left against the headers — a space keeps the grid
+                " " if kevin or r.get("rate") in (None, "") else r["rate"],
                 round(r.get("prior") or 0, 2), round(r.get("newSales") or 0, 2),
                 round(r.get("collections") or 0, 2), round(r.get("partial") or 0, 2),
                 round(r.get("totalColl") or 0, 2), round(r.get("earned") or 0, 2),
             ])
             for k in tot:
                 tot[k] += r.get(k) or 0
-        rows.append(["Total", None] + [round(tot[k], 2) for k in
+        rows.append(["Total", " "] + [round(tot[k], 2) for k in
                      ("prior", "newSales", "collections", "partial",
                       "totalColl", "earned")])
         pay = payment.get(partner)

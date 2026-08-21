@@ -416,22 +416,18 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
     old_end = int(m.group(1))
     del cxml
 
-    # Only genuinely NEW (company, partner) pairs get rows. Rate-variant
-    # differences on pairs Compiled already lists are far more likely to be
-    # server-side rate-engine drift than real new business (rehearsal on
-    # June-vs-June produced 1,160 rate variants and 0 truly new pairs) —
-    # those are surfaced for review instead of written.
-    existing_pairs = {(c, p) for c, p, _r in existing}
-    new_combos = sorted(c for c in combos
-                        if c not in existing
-                        and (c[0], c[1]) not in existing_pairs)
-    rate_variants = sum(1 for c in combos if c not in existing
-                        and (c[0], c[1]) in existing_pairs)
+    # EVERY bucket the data actually produces gets a row — new pairs AND
+    # rate variants of existing pairs. The engine deciding this is
+    # shadow_rate, which penny-matched the reconciled June book (all 18
+    # partners, diff 0.00), so a variant here is a real bucket; skipping
+    # them (the first, conservative policy) dropped those amounts out of
+    # Compiled and broke the Summary Pivot tie-outs by exactly that much
+    # (measured 11.9k on the 0821-1548 run).
+    new_combos = sorted(c for c in combos if c not in existing)
     # both pivot caches read Compiled C4:T3723 — appended rows must stay inside
     room = 3700 - last_used
     dropped_combos = max(0, len(new_combos) - max(room, 0))
     new_combos = new_combos[:max(room, 0)]
-    j["compiledRateVariantsSkipped"] = rate_variants
 
     mid2 = os.path.join(WORK, f"{job_id}_mid2.xlsx")
     os.replace(dst, mid2)
@@ -1308,7 +1304,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v37-fregex"
+VERSION = "2026-08-21-v38-allbuckets"
 
 
 @app.get("/health")
