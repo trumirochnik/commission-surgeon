@@ -379,6 +379,7 @@ def shadow_compiled(prior_rows, cur_rows, sales_rows, asof_serial: int,
         if isinstance(t, (int, float)) and t <= asof_serial:
             b["I"] -= n
 
+    pp_rows: list[list] = []
     for row in cur_rows:                              # 'Current Month' block
         company, partner = row[23], row[20]
         rate = shadow_rate(partner, company, row[8], row[7], row[5],
@@ -396,6 +397,16 @@ def shadow_compiled(prior_rows, cur_rows, sales_rows, asof_serial: int,
             al = min(aj, ak)
         b = bucket(company, partner, rate)
         b["K"] -= (al - n)                            # K = -sum(Difference)
+        # the Partial Payments tab row this comparison produces (Mike's
+        # hand step: 'this $70 flows to the Dashboard'): A partner,
+        # B transaction No., C partial amount, H SKU, I rate, J = C*I.
+        # Dashboard M's third term SUMIFs this tab by partner — with
+        # June's stale rows left in place, Summary L was off by exactly
+        # July's partial-payment earned (measured: Brian 11,904.50).
+        aa = al - n
+        if abs(aa) > 0.005:
+            pp_rows.append([partner, row[7], aa, None, None, None, None,
+                            row[8], rate, "=C{r}*I{r}"])
 
     for row in sales_rows:                            # 'New Sales' block
         company, partner = row[24], row[20]
@@ -418,7 +429,7 @@ def shadow_compiled(prior_rows, cur_rows, sales_rows, asof_serial: int,
                     "prior": b["G"], "newSales": b["H"],
                     "collections": b["I"] + b["J"], "partial": b["K"],
                     "totalColl": total, "earned": total * rate})
-    return out
+    return out, pp_rows
 
 
 def shadow_payment(compiled: list[dict], fee_table: dict) -> dict:

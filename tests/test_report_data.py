@@ -118,7 +118,7 @@ for r in sp + sc:
     r[5] = 46000                                  # F invoice date
 ss[0][5] = 46220; ss[0][19] = 46225               # sales deposited in July
 ss[0][6] = "Invoice"
-sh = rd.shadow_compiled(sp, sc, ss, 46234, {"95302": 0.1}, {"95302"}, CONSTS)
+sh, ppr = rd.shadow_compiled(sp, sc, ss, 46234, {"95302": 0.1}, {"95302"}, CONSTS)
 row = next(r for r in sh if r["partner"] == "Tiffany McDaniel")
 # G=140 prior, I=-100 (collected), K=-(AL-N)=-(100-30)=-70, H=50, J=-50
 check("shadow G/H/I/J/K/earned",
@@ -126,6 +126,10 @@ check("shadow G/H/I/J/K/earned",
       and abs(row["collections"] + 150) < 1e-9 and abs(row["partial"] + 70) < 1e-9
       and abs(row["totalColl"] + 220) < 1e-9 and abs(row["earned"] + 22) < 1e-9,
       row)
+check("partial-payment tab row emitted (partner, doc, amount, sku, rate)",
+      len(ppr) == 1 and ppr[0][0] == "Tiffany McDaniel" and ppr[0][1] == "726770"
+      and abs(ppr[0][2] - 70) < 1e-9 and ppr[0][7] == "95302"
+      and ppr[0][8] == 0.1 and ppr[0][9] == "=C{r}*I{r}", ppr)
 pay2 = rd.shadow_payment(sh, {"Tiffany McDaniel": 100.0})
 check("shadow payment net = min(0, earned+fee)",
       abs(pay2["Tiffany McDaniel"]["earned"] + 22) < 1e-9

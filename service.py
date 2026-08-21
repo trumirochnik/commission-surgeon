@@ -372,8 +372,14 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
     # reconciled 06.2026 book (all 18 partners, diff 0.00). Statements are
     # independent of the Dashboard's credit-memo adjustments — those touch
     # the accrual (V4/J), not the Data->Compiled chain.
-    shadow = rd.shadow_compiled(prior_rows, main["ar"], main["sales"],
-                                asof_serial, sku_rates, licensed_ids, consts)
+    shadow, pp_rows = rd.shadow_compiled(prior_rows, main["ar"], main["sales"],
+                                         asof_serial, sku_rates, licensed_ids,
+                                         consts)
+    # the Partial Payments tab is the written-out form of the K comparison;
+    # rows anchor at A4, J is the =C*I formula with real row numbers
+    for i, pr in enumerate(pp_rows):
+        pr[9] = pr[9].replace("{r}", str(4 + i))
+    j["partialPaymentRows"] = len(pp_rows)
     payment = rd.shadow_payment(shadow, _read_fee_table(src))
     period = data_spec.get("periodLabel") or data_spec.get("monthTag", "period")
     stmt_files = rd.build_statements(shadow, payment, period)
@@ -435,6 +441,10 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
     s3.paste_columns("Data", f"A{rd.DATA_FIRST_ROW}", built["pasteRows"],
                      clear_beyond=True)
     s3.set_cells("Data", dict(built["headerCells"]))
+    if pp_rows:
+        # July's partial-payment rows replace June's hand rows (headers in
+        # rows 1-3 survive; clear_beyond drops the stale remainder)
+        s3.paste_columns("Partial Payments", "A4", pp_rows, clear_beyond=True)
     if old_end != built["lastRow"]:
         s3.replace_formula_text("Compiled Data", [
             {"from": f"${old_end}", "to": f"${built['lastRow']}"}])
@@ -1304,7 +1314,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v38-allbuckets"
+VERSION = "2026-08-21-v39-partials"
 
 
 @app.get("/health")
