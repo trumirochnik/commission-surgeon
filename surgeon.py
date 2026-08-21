@@ -306,7 +306,15 @@ class XlsxSurgeon:
             raise KeyError(f"sheet {sheet!r} not found; have {self.sheet_names()}")
         self._ops.append(("replacef", sheet, list(replace)))
 
-    _F_ELEM = re.compile(r"(<f(?:\s[^>]*)?>)(.*?)(</f>)", re.S)
+    # (?<!/) keeps self-closed followers (<f t="shared" si="0"/>) out of the
+    # paired branch — without it the greedy attrs eat the '/' and the lazy
+    # body swallows everything to the NEXT </f>, and any replacement inside
+    # that span re-escapes swallowed MARKUP as text. That exact failure
+    # emptied Compiled Data on the 0821-1356 run (15k self-closed followers,
+    # every swallowed span contained the '$40074' target; Excel then
+    # repaired the file by stripping the sheet). Same bug family as the
+    # v32 _CELL_RE fix.
+    _F_ELEM = re.compile(r"(<f(?:\s[^>]*)?(?<!/)>)(.*?)(</f>)", re.S)
 
     @staticmethod
     def _xml_unescape_text(s: str) -> str:

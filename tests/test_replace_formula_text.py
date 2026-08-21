@@ -111,6 +111,51 @@ check("perMapping counts: literal=2, strip=2, optional-miss=0",
 check("retarget still applied alongside",
       "'AR_06.30'!$L:$L" in xml and "AR_05.31" not in xml, xml[:600])
 
+# ── 1b. self-closed follower BEFORE a target formula, with later </f>s:
+# the 0821-1356 corruption shape (Compiled Data). The follower must not
+# swallow the span, and the target must still be replaced cleanly.
+make_src(src)
+s = XlsxSurgeon(src, workdir=TD)
+# fixture: row 9 has the master (paired), row 10 the self-closed follower,
+# and E6/E7 targets come AFTER in document order? Build a dedicated sheet:
+SHEET2 = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+          '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+          '<dimension ref="A1:X40"/><sheetData>'
+          '<row r="5"><c r="G5" s="1"><f t="shared" ref="G5:G6" si="9">SUMIFS(X:X,"&lt;40074")</f><v>1</v></c>'
+          '<c r="H5" s="1"><f>N5*$40074</f><v>2</v></c></row>'
+          '<row r="6"><c r="G6" s="1"><f t="shared" si="9"/><v>3</v></c>'
+          '<c r="H6" s="1"><v>44</v></c>'
+          '<c r="I6" s="1"><f>SUMIFS(Y:Y,"&lt;40074")</f><v>5</v></c></row>'
+          '</sheetData></worksheet>')
+import zipfile as _zf2
+with open(src, "rb") as f:
+    pass
+with _zf2.ZipFile(src, "w", _zf2.ZIP_DEFLATED) as z:
+    z.writestr("[Content_Types].xml", CT)
+    z.writestr("_rels/.rels", ROOT_RELS)
+    z.writestr("xl/workbook.xml", WB)
+    z.writestr("xl/_rels/workbook.xml.rels", WB_RELS)
+    z.writestr("xl/worksheets/sheet1.xml", SHEET2)
+s = XlsxSurgeon(src, workdir=TD)
+s.replace_formula_text("Dashboard", [{"from": "40074", "to": "45999"}])
+res_sc = s.apply(os.path.join(TD, "out_sc.xlsx"))
+with _zf2.ZipFile(os.path.join(TD, "out_sc.xlsx")) as z:
+    xsc = z.read("xl/worksheets/sheet1.xml").decode()
+import xml.etree.ElementTree as _ET
+try:
+    _ET.fromstring(xsc)
+    wellformed = True
+except _ET.ParseError:
+    wellformed = False
+check("self-closed follower does not swallow the span (well-formed XML)",
+      wellformed, xsc[:400])
+check("all three targets replaced, follower untouched",
+      xsc.count("45999") == 3 and '<f t="shared" si="9"/>' in xsc
+      and "&lt;c" not in xsc and "40074" not in xsc, xsc)
+fr_sc = next(r for r in res_sc if r["op"] == "replace_formula_text")
+check("counts correct with followers present",
+      fr_sc["perMapping"]["40074"] == 3, fr_sc)
+
 # ── 2. non-optional mapping matching nothing fails the job
 make_src(src)
 s = XlsxSurgeon(src, workdir=TD)

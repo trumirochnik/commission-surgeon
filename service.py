@@ -1308,7 +1308,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v36-passes"
+VERSION = "2026-08-21-v37-fregex"
 
 
 @app.get("/health")
