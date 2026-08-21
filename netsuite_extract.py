@@ -870,10 +870,24 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
                 items[str(g(r, 1))] = re.sub(r"\s+", " ", str(desc)).strip()
 
     asof_serial = serial(asof)
+    # units-by-sku (new-items input) is the ONLY thing that still needs the
+    # raw line dicts after the rows are built — compute it now so both raw
+    # lists (30k dicts x 15 keys, 60-120MB) can be released immediately
+    # after their build. The raw-stage OOMs kept happening with the extract
+    # era's lifetime peak dominating the container.
+    sf0 = -1 if sign_flip else 1
+    units_by_sku: dict[str, float] = {}
+    for r in sales_raw:
+        q = num(g(r, 6))
+        if isinstance(q, float):
+            sku = str(g(r, 5))
+            units_by_sku[sku] = units_by_sku.get(sku, 0.0) + q * sf0
     ar_rows, ar_diag = build_ar_rows(ar_raw, cust, items, states, partners,
                                      accounts, sign_flip)
+    del ar_raw
     sales_rows, sales_diag = build_sales_rows(sales_raw, cust, items, states,
                                               asof_serial, sign_flip)
+    del sales_raw
 
     # SOP step 4 input: SKUs first fulfilled inside the period, with units
     # sold this period (from the lines already extracted) and the real
@@ -881,13 +895,7 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
     # 'Commission Rate by SKUs' tab (the service does this when readRanges
     # supplies that list).
     first_fulfilled, ni_basis = fetch_new_items(mcp, frm, to, log=log)
-    sf = -1 if sign_flip else 1
-    units_by_sku: dict[str, float] = {}
-    for r in sales_raw:
-        q = num(g(r, 6))
-        if isinstance(q, float):
-            sku = str(g(r, 5))
-            units_by_sku[sku] = units_by_sku.get(sku, 0.0) + q * sf
+    # units_by_sku was computed above, before the raw lists were released
     ni_ids = [sku for sku, _d in first_fulfilled if sku not in items]
     for batch in chunks(ni_ids, CUST_BATCH):
         for r in mcp.rows(q_items(batch), "new item desc"):

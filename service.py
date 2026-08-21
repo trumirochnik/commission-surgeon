@@ -1194,13 +1194,17 @@ def _run(job_id: str, job: Job):
                 ("ar_dashboard", lambda: caller_p1 + _load_spill("p1")),
                 ("sales", lambda: caller_sales + _load_spill("sales")),
                 ("prior_refresh", lambda: _load_spill("prior")),
-                ("raw_final", lambda: _load_spill("raw") + caller_last),
+                # raw runs ALONE — this pass has been the OOM site across
+                # every architecture, so it gets the container to itself
+                ("raw_append", lambda: _load_spill("raw")),
+                ("finalize", lambda: list(caller_last)),
             ]
             has = {
                 "ar_dashboard": bool(caller_p1) or os.path.exists(_spill_path("p1")),
                 "sales": bool(caller_sales) or os.path.exists(_spill_path("sales")),
                 "prior_refresh": os.path.exists(_spill_path("prior")),
-                "raw_final": bool(caller_last) or os.path.exists(_spill_path("raw")),
+                "raw_append": os.path.exists(_spill_path("raw")),
+                "finalize": bool(caller_last),
             }
             labels = [lb for lb, _fn in PASSES if has[lb]]
             results = []
@@ -1322,7 +1326,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v40-truerates"
+VERSION = "2026-08-21-v41-rawalone"
 
 
 @app.get("/health")
