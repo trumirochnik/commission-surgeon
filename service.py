@@ -460,6 +460,17 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
         s3.set_cells("Compiled Data", rd.compiled_combo_rows(
             new_combos, last_used + 1, built["lastRow"],
             data_spec.get("monthTag", "")))
+    # the Data tab's rows 4/5/9 carry Mike's own header-check formulas
+    # (=C10='AR_06.30'!A6 ...) against the PRIOR tab — inherited stale every
+    # month. Month-shift them onto the new prior tab; optional because a
+    # given book may have none left. This also clears the Data-side
+    # references that block deleting the retired tab.
+    _del_names = [(e.get("sheet") if isinstance(e, dict) else e)
+                  for e in (job.extract.get("deleteSheets") or [])]
+    _rt = [{"from": n, "to": prior_tab, "optional": True}
+           for n in _del_names if n and n != prior_tab]
+    if _rt:
+        s3.retarget_refs("Data", _rt)
     del built["pasteRows"]
     results = s3.apply(dst)
     del s3
@@ -1108,6 +1119,19 @@ def _run(job_id: str, job: Job):
                         "came back — refusing to blank the tab's Date Closed "
                         "column against that.")
                 hit = enrich_prior_rows(prows, typed_map, doc_map)
+                # freeze the prior tab's L2 header to its cached value: its
+                # formula chains to the TWO-months-back tab ('AR_06.30'!V4 -
+                # self!L3), which is exactly the tab deleteSheets retires —
+                # a live formula there blocks the delete guard forever and
+                # would go #REF the month the chain breaks. The cached value
+                # is what Mike's own saved book displays.
+                try:
+                    _l2 = _read_sheet_cols(src, prior_spec["target"],
+                                           ["L"], 2, 2).get(2, {}).get("L")
+                    if isinstance(_l2, (int, float)):
+                        prior_spec.setdefault("headerCells", {})["L2"] = _l2
+                except Exception as _e:  # noqa: BLE001 — cosmetic header cell
+                    _log(f"[priorAr] L2 freeze skipped: {_e}")
                 bal = round(sum(r[11] for r in prows
                                 if isinstance(r[11], (int, float))), 2)
                 pops, preport = build_prior_ops(
@@ -1384,7 +1408,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-25-v43-delete-after-phase3"
+VERSION = "2026-09-01-v44-cleandelete"
 
 
 @app.get("/health")

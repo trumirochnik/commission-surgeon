@@ -580,16 +580,25 @@ class XlsxSurgeon:
             wb_rels = re.sub(r'<Relationship\b[^>]*calcChain\.xml[^>]*/>', "", wb_rels)
 
 
-        # deleted sheets: guard-scan every kept part for live references,
-        # then unregister the sheet and drop its parts from the output
+        # deleted sheets: the sheet's OWN scoped defined names (autofilter
+        # ranges etc.) are removed with it, every later sheet's localSheetId
+        # is DECREMENTED (it indexes sheet ORDER — leaving it stale silently
+        # rebinds names to the wrong sheets), and only then is the guard run
+        # over the remaining parts + workbook-level names. A blocked
+        # optional delete records WHICH part blocks it, visible in the ops
+        # table ("<name> — skipped: ...").
         for name, opt in del_sheets:
             part = self._sheet_parts.get(name)
+
+            def _skip(reason):
+                results.append({"op": "delete_sheet",
+                                "sheet": f"{name} — skipped: {reason}",
+                                "target": name, "kind": "delete_sheet",
+                                "cellsChanged": 0, "skipped": reason})
+
             if not part:
                 if opt:
-                    results.append({"op": "delete_sheet", "sheet": name,
-                                    "target": name, "kind": "delete_sheet",
-                                    "cellsChanged": 0,
-                                    "skipped": "sheet not present"})
+                    _skip("sheet not present")
                     continue
                 raise ValueError(f"delete_sheet: sheet {name!r} not found")
             if part in per_part:
@@ -601,10 +610,7 @@ class XlsxSurgeon:
             ref_in = self._scan_for_refs(part, needles)
             if ref_in:
                 if opt:
-                    results.append({"op": "delete_sheet", "sheet": name,
-                                    "target": name, "kind": "delete_sheet",
-                                    "cellsChanged": 0,
-                                    "skipped": f"still referenced in {ref_in}"})
+                    _skip(f"still referenced in {ref_in}")
                     continue
                 raise ValueError(
                     f"delete_sheet: {name!r} is still referenced in "
@@ -614,8 +620,33 @@ class XlsxSurgeon:
             if not m:
                 raise ValueError(f"delete_sheet: no workbook entry for {name!r}")
             tag = m.group(0)
+            # ordinal position among <sheet> entries = the localSheetId space
+            pos = len(re.findall(r'<sheet\b', wb_xml[:m.start()]))
+            # simulate the post-delete defined-name state BEFORE committing:
+            # drop names scoped to this sheet, reindex the later ones
+            wb_try = wb_xml.replace(tag, "", 1)
+            wb_try = re.sub(
+                r'<definedName\b[^>]*localSheetId="' + str(pos)
+                + r'"[^>]*(?:/>|>.*?</definedName>)', "", wb_try)
+
+            def _reindex(mm):
+                return mm.group(1) + str(int(mm.group(2)) - 1) + mm.group(3)
+            wb_try = re.sub(r'(localSheetId=")(\d+)(")',
+                            lambda mm: _reindex(mm) if int(mm.group(2)) > pos
+                            else mm.group(0), wb_try)
+            # any REMAINING workbook-level reference (a global defined name,
+            # another sheet's scoped name pointing here) still blocks
+            blocked = next((n.decode("utf-8") for n in needles[:2]
+                            if n.decode("utf-8") in wb_try), None)
+            if blocked:
+                if opt:
+                    _skip("still referenced by a workbook-level defined name")
+                    continue
+                raise ValueError(
+                    f"delete_sheet: {name!r} is still referenced by a "
+                    "workbook-level defined name")
+            wb_xml = wb_try
             rid_m = re.search(r'r:id="([^"]+)"', tag)
-            wb_xml = wb_xml.replace(tag, "", 1)
             if rid_m:
                 wb_rels = re.sub(
                     r'<Relationship\b[^>]*Id="' + re.escape(rid_m.group(1))
@@ -627,12 +658,6 @@ class XlsxSurgeon:
             rels_part = f"xl/worksheets/_rels/{os.path.basename(part)}.rels"
             if rels_part in self._names:
                 drop.add(rels_part)
-            # defined names still pointing at the sheet live in wb_xml
-            for n in needles[:2]:
-                if n.decode("utf-8") in wb_xml:
-                    raise ValueError(
-                        f"delete_sheet: {name!r} is still referenced by a "
-                        "workbook-level defined name")
             results.append({"op": "delete_sheet", "sheet": name,
                             "target": name, "kind": "delete_sheet",
                             "cellsChanged": 1})
@@ -754,7 +779,7 @@ class XlsxSurgeon:
             if kind == "retarget":
                 sheet_counts = self._retarget_counts.get(target, {})
                 for m in payload:
-                    if sheet_counts.get(m["from"], 0) == 0:
+                    if sheet_counts.get(m["from"], 0) == 0                             and not m.get("optional"):
                         raise ValueError(
                             f"retarget_refs on {target!r}: mapping "
                             f"{m['from']}->{m['to']} made 0 replacements — "
@@ -788,6 +813,12 @@ class XlsxSurgeon:
 
         if sum(r["cellsChanged"] for r in results) == 0 \
                 and not self._retarget_counts:
+            # a delete-only pass whose every target was optional-skipped is
+            # a faithful copy, not a broken transform — return the skip
+            # results (with their reasons) instead of failing the pass
+            if results and all(r.get("kind") == "delete_sheet"
+                               and r.get("skipped") for r in results):
+                return results
             raise ValueError(
                 "no op changed anything — refusing to upload an unmodified file")
         return results

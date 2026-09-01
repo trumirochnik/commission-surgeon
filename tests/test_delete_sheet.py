@@ -39,7 +39,8 @@ def sheet_xml(formula=None, text=None):
             f'<row r="1">{cell}</row></sheetData></worksheet>')
 
 
-def build(path, ref_formula=None, defined_name=None, shared_text=None):
+def build(path, ref_formula=None, defined_name=None, shared_text=None,
+          scoped=None):
     wb = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
           f'<workbook xmlns="{NS_MAIN}" xmlns:r="{NS_R}">'
           '<bookViews><workbookView activeTab="2"/></bookViews>'
@@ -48,8 +49,13 @@ def build(path, ref_formula=None, defined_name=None, shared_text=None):
           '<sheet name="Mid" sheetId="2" r:id="rId2"/>'
           '<sheet name="AR_05.31" sheetId="3" r:id="rId3"/>'
           '</sheets>'
-          + (f'<definedNames><definedName name="X">{defined_name}'
-             '</definedName></definedNames>' if defined_name else "")
+          + (('<definedNames>'
+              + (f'<definedName name="X">{defined_name}</definedName>'
+                 if defined_name else '')
+              + ''.join(f'<definedName name="{nm}" localSheetId="{li}">{ref}'
+                        '</definedName>' for nm, li, ref in (scoped or []))
+              + '</definedNames>')
+             if (defined_name or scoped) else "")
           + '<calcPr calcId="1"/></workbook>')
     wb_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                f'<Relationships xmlns="{NS_REL}">'
@@ -179,6 +185,49 @@ res = s.apply(DST)
 check("O3: optional missing sheet skips",
       any(r.get("op") == "delete_sheet" and r.get("skipped") == "sheet not present"
           for r in res), res)
+
+# ── 9. scoped defined names: deleted sheet's own names removed, later
+# sheets' localSheetId reindexed, earlier untouched ──
+# sheets order: Keep(0) Mid(1) AR_05.31(2); add a FOURTH conceptual name set
+build(SRC, scoped=[
+    ("_xlnm._FilterDatabase", 0, "Keep!$A$1:$C$9"),        # before: keep as-is
+    ("_xlnm._FilterDatabase", 2, "'AR_05.31'!$A$6:$AO$99"),  # the sheet's own
+])
+s = XlsxSurgeon(SRC, workdir=tmp)
+s.delete_sheet("AR_05.31")
+res = s.apply(DST)
+with zipfile.ZipFile(DST) as z:
+    wb = z.read("xl/workbook.xml").decode()
+check("N1: the deleted sheet's own scoped name is gone",
+      "AR_05.31" not in wb, wb)
+check("N2: earlier sheet's scoped name untouched",
+      'localSheetId="0">Keep!$A$1:$C$9' in wb, wb)
+check("N3: delete landed", any(r.get("op") == "delete_sheet"
+      and r.get("cellsChanged") == 1 for r in res), res)
+
+# delete the MIDDLE sheet: the later sheet's scoped name must reindex 2 -> 1
+build(SRC, scoped=[
+    ("_xlnm._FilterDatabase", 1, "Mid!$A$1:$B$5"),           # the deleted one's
+    ("_xlnm._FilterDatabase", 2, "'AR_05.31'!$A$6:$AO$99"),  # must become 1
+])
+s = XlsxSurgeon(SRC, workdir=tmp)
+s.delete_sheet("Mid")
+res = s.apply(DST)
+with zipfile.ZipFile(DST) as z:
+    wb = z.read("xl/workbook.xml").decode()
+check("N4: middle sheet's own scoped name gone", "Mid!$A$1" not in wb, wb)
+check("N5: later sheet's localSheetId decremented",
+      "localSheetId=\"1\">'AR_05.31'!$A$6" in wb, wb)
+
+# ── 10. skip reason is visible in the display label ──
+build(SRC, ref_formula="SUM('AR_05.31'!A1:A9)")
+s = XlsxSurgeon(SRC, workdir=tmp)
+s.set_cells("Keep", {"B1": "x"})
+s.delete_sheet("AR_05.31", optional=True)
+res = s.apply(DST)
+lbl = next(r["sheet"] for r in res if r.get("op") == "delete_sheet")
+check("V1: skip reason rides the sheet label (email ops table shows it)",
+      lbl.startswith("AR_05.31 — skipped: still referenced"), lbl)
 
 print()
 print("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}")
