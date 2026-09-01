@@ -1103,8 +1103,13 @@ def _run(job_id: str, job: Job):
             # two-months-back tab frozen — which he then reviewed, confused.
             # extract.deleteSheets drops it. delete_sheet rides the finalize
             # pass, after the Dashboard retargets removed every reference.
-            for _nm in (job.extract.get("deleteSheets") or []):
-                job.ops.append({"op": "delete_sheet", "sheet": _nm})
+            for _e in (job.extract.get("deleteSheets") or []):
+                if isinstance(_e, dict):
+                    job.ops.append({"op": "delete_sheet",
+                                    "sheet": _e.get("sheet"),
+                                    "optional": bool(_e.get("optional"))})
+                else:
+                    job.ops.append({"op": "delete_sheet", "sheet": _e})
             data_spec = job.extract.get("dataTab")
             if data_spec and job.extract.get("applyOps", True):
                 if not job.extract.get("priorAr"):
@@ -1167,7 +1172,8 @@ def _run(job_id: str, job: Job):
                 elif kind == "pivot_refresh_on_load":
                     surgeon.pivot_refresh_on_load()
                 elif kind == "delete_sheet":
-                    surgeon.delete_sheet(op["sheet"])
+                    surgeon.delete_sheet(op["sheet"],
+                                         optional=bool(op.get("optional")))
                 else:
                     raise ValueError(f"unknown op {kind!r}")
 

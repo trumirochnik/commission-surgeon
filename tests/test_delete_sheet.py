@@ -156,6 +156,30 @@ try:
 except ValueError as e:
     check("G5: unknown sheet refuses", "not found" in str(e), e)
 
+# ── 7. optional: referenced sheet SKIPS instead of failing ──
+build(SRC, ref_formula="SUM('AR_05.31'!A1:A9)")
+s = XlsxSurgeon(SRC, workdir=tmp)
+s.set_cells("Keep", {"B1": "real work"})   # deletes always ride along real ops
+s.delete_sheet("AR_05.31", optional=True)
+res = s.apply(DST)
+skipped = [r for r in res if r.get("op") == "delete_sheet"]
+check("O1: optional referenced delete skips with a reason",
+      len(skipped) == 1 and skipped[0]["cellsChanged"] == 0
+      and "still referenced" in skipped[0].get("skipped", ""), skipped)
+with zipfile.ZipFile(DST) as z:
+    check("O2: skipped sheet survives intact",
+          "xl/worksheets/sheet3.xml" in z.namelist())
+
+# ── 8. optional: missing sheet skips at queue AND apply ──
+build(SRC)
+s = XlsxSurgeon(SRC, workdir=tmp)
+s.set_cells("Keep", {"B1": "real work"})
+s.delete_sheet("Nope", optional=True)
+res = s.apply(DST)
+check("O3: optional missing sheet skips",
+      any(r.get("op") == "delete_sheet" and r.get("skipped") == "sheet not present"
+          for r in res), res)
+
 print()
 print("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}")
 sys.exit(1 if fails else 0)

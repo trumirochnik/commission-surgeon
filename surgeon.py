@@ -142,7 +142,7 @@ class XlsxSurgeon:
         return list(self._sheet_parts)
 
     # -- public ops --------------------------------------------------------
-    def delete_sheet(self, sheet: str):
+    def delete_sheet(self, sheet: str, optional: bool = False):
         """Remove a worksheet outright: its workbook <sheet> entry, the
         relationship, the Content_Types override, the part and its _rels.
         REFUSES (at apply time) if any kept part still references the sheet
@@ -150,10 +150,14 @@ class XlsxSurgeon:
         guard scans this surgeon's INPUT file, so any retarget_refs that
         remove the references must run in an EARLIER pass/apply (the
         monthly flow's pass order already guarantees this: Dashboard
-        retargets run in pass 1, deletes ride the finalize pass)."""
-        if sheet not in self._sheet_parts:
+        retargets run in pass 1, deletes ride the finalize pass).
+
+        With optional=True a sheet that is missing or still referenced is
+        SKIPPED (recorded in results with cellsChanged 0) instead of
+        failing the job — for backlog cleanup in unattended monthly runs."""
+        if sheet not in self._sheet_parts and not optional:
             raise ValueError(f"delete_sheet: sheet {sheet!r} not found")
-        self._ops.append(("delsheet", sheet, None))
+        self._ops.append(("delsheet", sheet, {"optional": optional}))
 
     def _scan_for_refs(self, skip_part: str, needles: list[bytes]) -> str | None:
         """Streaming scan of every kept part for any needle; returns the
@@ -423,7 +427,7 @@ class XlsxSurgeon:
             if kind == "pivotreload":
                 continue
             if kind == "delsheet":
-                del_sheets.append(target)
+                del_sheets.append((target, bool((payload or {}).get("optional"))))
                 continue
             if kind == "add":
                 new_sheets.append((target, payload))
@@ -578,9 +582,15 @@ class XlsxSurgeon:
 
         # deleted sheets: guard-scan every kept part for live references,
         # then unregister the sheet and drop its parts from the output
-        for name in del_sheets:
+        for name, opt in del_sheets:
             part = self._sheet_parts.get(name)
             if not part:
+                if opt:
+                    results.append({"op": "delete_sheet", "sheet": name,
+                                    "target": name, "kind": "delete_sheet",
+                                    "cellsChanged": 0,
+                                    "skipped": "sheet not present"})
+                    continue
                 raise ValueError(f"delete_sheet: sheet {name!r} not found")
             if part in per_part:
                 raise ValueError(f"delete_sheet: {name!r} is also targeted "
@@ -590,6 +600,12 @@ class XlsxSurgeon:
                        f'sheet="{esc(name)}"'.encode("utf-8")]
             ref_in = self._scan_for_refs(part, needles)
             if ref_in:
+                if opt:
+                    results.append({"op": "delete_sheet", "sheet": name,
+                                    "target": name, "kind": "delete_sheet",
+                                    "cellsChanged": 0,
+                                    "skipped": f"still referenced in {ref_in}"})
+                    continue
                 raise ValueError(
                     f"delete_sheet: {name!r} is still referenced in "
                     f"{ref_in} — retarget those references first")
