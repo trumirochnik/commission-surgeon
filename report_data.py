@@ -357,13 +357,18 @@ def shadow_compiled(prior_rows, cur_rows, sales_rows, asof_serial: int,
         read from the tab arrive as floats while extract rows are ints/
         strings, and Excel's CONCAT renders all three the same way. The
         mismatched f-string keys silently broke every prior-balance lookup
-        on real runs (found 0821 via the Brian L-residual decomposition)."""
+        on real runs (found 0821 via the Brian L-residual decomposition).
+
+        Excel-faithful (Mike/Preet 2026-08-25: PP tab disagreed with the
+        Data tab's own XLOOKUP on some records): CONCAT does NOT trim text
+        — so neither do we — and XLOOKUP's exact match is CASE-INSENSITIVE,
+        so keys compare casefolded (see key_of)."""
         if isinstance(v, float) and v.is_integer():
             return str(int(v))
-        return "" if v is None else str(v).strip()
+        return "" if v is None else str(v)
 
     def key_of(row):
-        return f"{_idtxt(row[23])}{_idtxt(row[7])}{_idtxt(row[8])}"
+        return (_idtxt(row[23]) + _idtxt(row[7]) + _idtxt(row[8])).casefold()
 
     prior_bal = {}
     for row in prior_rows:

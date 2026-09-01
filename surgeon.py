@@ -142,6 +142,47 @@ class XlsxSurgeon:
         return list(self._sheet_parts)
 
     # -- public ops --------------------------------------------------------
+    def delete_sheet(self, sheet: str):
+        """Remove a worksheet outright: its workbook <sheet> entry, the
+        relationship, the Content_Types override, the part and its _rels.
+        REFUSES (at apply time) if any kept part still references the sheet
+        by name — deleting a referenced sheet is how #REF! ships. NOTE the
+        guard scans this surgeon's INPUT file, so any retarget_refs that
+        remove the references must run in an EARLIER pass/apply (the
+        monthly flow's pass order already guarantees this: Dashboard
+        retargets run in pass 1, deletes ride the finalize pass)."""
+        if sheet not in self._sheet_parts:
+            raise ValueError(f"delete_sheet: sheet {sheet!r} not found")
+        self._ops.append(("delsheet", sheet, None))
+
+    def _scan_for_refs(self, skip_part: str, needles: list[bytes]) -> str | None:
+        """Streaming scan of every kept part for any needle; returns the
+        first part name that matches, else None. sharedStrings/docProps are
+        skipped (cell TEXT can't reference a sheet), binaries too."""
+        skip = {skip_part,
+                f"xl/worksheets/_rels/{os.path.basename(skip_part)}.rels",
+                "xl/calcChain.xml", "xl/sharedStrings.xml",
+                "[Content_Types].xml", "xl/workbook.xml",
+                "xl/_rels/workbook.xml.rels"}
+        ov = max(len(n) for n in needles)
+        with zipfile.ZipFile(self.src) as zf:
+            for nm in zf.namelist():
+                if (nm in skip or nm.startswith("docProps/")
+                        or nm.endswith((".bin", ".png", ".jpg", ".jpeg",
+                                        ".gif", ".emf", ".vml"))):
+                    continue
+                tail = b""
+                with zf.open(nm) as f:
+                    while True:
+                        chunk = f.read(1 << 22)
+                        if not chunk:
+                            break
+                        buf = tail + chunk
+                        if any(n in buf for n in needles):
+                            return nm
+                        tail = buf[-ov:]
+        return None
+
     def set_cells(self, sheet: str, cells: dict, style_from: dict | None = None):
         # may target a sheet created by duplicate_sheet earlier in the same job
         pending_dup = any(o[0] == "dup" and o[1] == sheet for o in self._ops)
@@ -377,8 +418,12 @@ class XlsxSurgeon:
         new_sheets = []
         dup_sheets = []
         pivot_reload = any(k == "pivotreload" for k, _t, _p in self._ops)
+        del_sheets = []
         for kind, target, payload in self._ops:
             if kind == "pivotreload":
+                continue
+            if kind == "delsheet":
+                del_sheets.append(target)
                 continue
             if kind == "add":
                 new_sheets.append((target, payload))
@@ -530,6 +575,57 @@ class XlsxSurgeon:
             ctypes = re.sub(r'<Override PartName="/xl/calcChain\.xml"[^>]*/>', "", ctypes)
             wb_rels = re.sub(r'<Relationship\b[^>]*calcChain\.xml[^>]*/>', "", wb_rels)
 
+
+        # deleted sheets: guard-scan every kept part for live references,
+        # then unregister the sheet and drop its parts from the output
+        for name in del_sheets:
+            part = self._sheet_parts.get(name)
+            if not part:
+                raise ValueError(f"delete_sheet: sheet {name!r} not found")
+            if part in per_part:
+                raise ValueError(f"delete_sheet: {name!r} is also targeted "
+                                 "by other ops in this apply")
+            needles = [f"'{esc(name)}'!".encode("utf-8"),
+                       f"{esc(name)}!".encode("utf-8"),
+                       f'sheet="{esc(name)}"'.encode("utf-8")]
+            ref_in = self._scan_for_refs(part, needles)
+            if ref_in:
+                raise ValueError(
+                    f"delete_sheet: {name!r} is still referenced in "
+                    f"{ref_in} — retarget those references first")
+            m = re.search(r'<sheet\b[^>]*name="' + re.escape(esc(name))
+                          + r'"[^>]*/?>', wb_xml)
+            if not m:
+                raise ValueError(f"delete_sheet: no workbook entry for {name!r}")
+            tag = m.group(0)
+            rid_m = re.search(r'r:id="([^"]+)"', tag)
+            wb_xml = wb_xml.replace(tag, "", 1)
+            if rid_m:
+                wb_rels = re.sub(
+                    r'<Relationship\b[^>]*Id="' + re.escape(rid_m.group(1))
+                    + r'"[^>]*/?>', "", wb_rels, count=1)
+            ctypes = re.sub(
+                r'<Override PartName="/' + re.escape(part) + r'"[^>]*/>',
+                "", ctypes, count=1)
+            drop.add(part)
+            rels_part = f"xl/worksheets/_rels/{os.path.basename(part)}.rels"
+            if rels_part in self._names:
+                drop.add(rels_part)
+            # defined names still pointing at the sheet live in wb_xml
+            for n in needles[:2]:
+                if n.decode("utf-8") in wb_xml:
+                    raise ValueError(
+                        f"delete_sheet: {name!r} is still referenced by a "
+                        "workbook-level defined name")
+            results.append({"op": "delete_sheet", "sheet": name,
+                            "target": name, "kind": "delete_sheet",
+                            "cellsChanged": 1})
+        if del_sheets:
+            # a now-out-of-range activeTab makes Excel repair the file
+            n_sheets = len(re.findall(r'<sheet\b', wb_xml))
+            at = re.search(r'activeTab="(\d+)"', wb_xml)
+            if at and int(at.group(1)) >= n_sheets:
+                wb_xml = wb_xml.replace(at.group(0), 'activeTab="0"', 1)
         # force full recalc on open
         if "<calcPr" in wb_xml:
             if "fullCalcOnLoad" in wb_xml:

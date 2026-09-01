@@ -1055,21 +1055,27 @@ def _run(job_id: str, job: Job):
             # term of Dashboard E is blind (measured: J 594k vs Mike's 0).
             prior_spec = job.extract.get("priorAr")
             if prior_spec and job.extract.get("applyOps", True):
-                from netsuite_extract import serial as _serial, enrich_prior_rows
-                close_map = run_prior_extract(job.extract, prior_spec, log=_log)
-                if len(close_map) < 100:
-                    raise ValueError(
-                        f"prior-AR refresh: only {len(close_map)} close dates "
-                        "came back — refusing to blank the tab's Date Closed "
-                        "column against that.")
+                from netsuite_extract import (serial as _serial,
+                                              enrich_prior_rows, norm_docno)
                 first = int(re.search(r"(\d+)$",
                                       prior_spec.get("anchor", "A7")).group(1))
+                # read the tab FIRST — the close-date pull is keyed on its
+                # own document numbers (no open-at-asof filter; that filter
+                # is how already-closed docs shipped with a blank T)
                 prows = _read_prior_rows(src, prior_spec["target"], first)
                 if len(prows) < 1000:
                     raise ValueError(
                         f"prior tab read back only {len(prows)} rows — "
                         "refusing to rewrite it.")
-                hit = enrich_prior_rows(prows, close_map)
+                docnos = {norm_docno(r[7]) for r in prows} - {None, ""}
+                typed_map, doc_map = run_prior_extract(job.extract, docnos,
+                                                       log=_log)
+                if len(doc_map) < 100:
+                    raise ValueError(
+                        f"prior-AR refresh: only {len(doc_map)} close dates "
+                        "came back — refusing to blank the tab's Date Closed "
+                        "column against that.")
+                hit = enrich_prior_rows(prows, typed_map, doc_map)
                 bal = round(sum(r[11] for r in prows
                                 if isinstance(r[11], (int, float))), 2)
                 pops, preport = build_prior_ops(
@@ -1088,10 +1094,17 @@ def _run(job_id: str, job: Job):
                     with open(os.path.join(WORK, f"{job_id}_report_prior.pkl"),
                               "wb") as pf:
                         pickle.dump(prows, pf)
-                del close_map, prows, pops
+                del typed_map, doc_map, prows, pops
             # reporting half: stash the row-sets on DISK for phase 3 — the
             # Data-tab ops (~46k rows + formula cells) are built only when
             # that phase runs, so phases 1-2 never hold them in memory
+            # Mike/Preet 2026-08-25: his manual flow RECYCLES two AR tabs
+            # (paste-over + rename); ours added a third and left the
+            # two-months-back tab frozen — which he then reviewed, confused.
+            # extract.deleteSheets drops it. delete_sheet rides the finalize
+            # pass, after the Dashboard retargets removed every reference.
+            for _nm in (job.extract.get("deleteSheets") or []):
+                job.ops.append({"op": "delete_sheet", "sheet": _nm})
             data_spec = job.extract.get("dataTab")
             if data_spec and job.extract.get("applyOps", True):
                 if not job.extract.get("priorAr"):
@@ -1153,6 +1166,8 @@ def _run(job_id: str, job: Job):
                     surgeon.copy_range_values(op["sheet"], op["from"], op["to"])
                 elif kind == "pivot_refresh_on_load":
                     surgeon.pivot_refresh_on_load()
+                elif kind == "delete_sheet":
+                    surgeon.delete_sheet(op["sheet"])
                 else:
                     raise ValueError(f"unknown op {kind!r}")
 
@@ -1326,7 +1341,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-21-v41-rawalone"
+VERSION = "2026-08-25-v42-reviewfixes"
 
 
 @app.get("/health")

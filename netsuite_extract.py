@@ -577,6 +577,7 @@ def build_ar_rows(raw: list[dict], cust: dict[str, dict],
     sf = -1 if sign_flip else 1
     out: list[list] = []
     skipped_partner = skipped_company = unmatched = 0
+    skipped_none = 0
 
     for r in raw:
         partner = g(r, 9)
@@ -590,6 +591,14 @@ def build_ar_rows(raw: list[dict], cust: dict[str, dict],
         company = _dim_lookup(c, "company")
         if company and company in EXCLUDED_COMPANIES:
             skipped_company += 1
+            continue
+        # Mike/Preet review 2026-08-25: exclude rows whose PRIMARY partner is
+        # the literal partner record "None" (Target/Walmart-style house
+        # accounts — no commission, ~half the sales rows, most of the file
+        # size). BLANK primary partner stays in for now, per Mike.
+        primary = _dim_lookup(c, "partner")
+        if isinstance(primary, str) and primary.strip().casefold() == "none":
+            skipped_none += 1
             continue
         # AR is Romane-scoped, and only these store types are commissionable.
         if c and c.get("category") != "Romane":
@@ -628,6 +637,7 @@ def build_ar_rows(raw: list[dict], cust: dict[str, dict],
 
     return out, {"skipped_partner": skipped_partner,
                  "skipped_company": skipped_company,
+                 "skipped_primary_none": skipped_none,
                  "unmatched_customers": unmatched}
 
 
@@ -651,6 +661,7 @@ def build_sales_rows(raw: list[dict], cust: dict[str, dict],
     sf = -1 if sign_flip else 1
     out: list[list] = []
     skipped_partner = skipped_company = unmatched = 0
+    skipped_none = 0
 
     for r in raw:
         partner = g(r, 9)
@@ -664,6 +675,14 @@ def build_sales_rows(raw: list[dict], cust: dict[str, dict],
         company = _dim_lookup(c, "company")
         if company and company in EXCLUDED_COMPANIES:
             skipped_company += 1
+            continue
+        # Mike/Preet review 2026-08-25: exclude rows whose PRIMARY partner is
+        # the literal partner record "None" (Target/Walmart-style house
+        # accounts — no commission, ~half the sales rows, most of the file
+        # size). BLANK primary partner stays in for now, per Mike.
+        primary = _dim_lookup(c, "partner")
+        if isinstance(primary, str) and primary.strip().casefold() == "none":
+            skipped_none += 1
             continue
 
         qty, amt = num(g(r, 6)), num(g(r, 7))
@@ -701,6 +720,7 @@ def build_sales_rows(raw: list[dict], cust: dict[str, dict],
 
     return out, {"skipped_partner": skipped_partner,
                  "skipped_company": skipped_company,
+                 "skipped_primary_none": skipped_none,
                  "unmatched_customers": unmatched}
 
 
@@ -1014,40 +1034,76 @@ def norm_docno(v) -> str | None:
     return str(v).strip()
 
 
-def fetch_prior_closedates(mcp: Mcp, asof: str, log=print) -> dict[str, int]:
-    """{document 'No.' -> Date Closed serial} for every invoice open at
-    `asof`, evaluated NOW — the enrichment feed for the prior-tab refresh.
-
-    Deliberately NOT a data re-pull: the tab's pasted L values (the as-of
-    balances Mike closed the month on) stay untouched as ground truth.
-    v29 replaced them with q_ar's reconstructed as-of balance and the
-    total came back 1.02M against the tab's 1.78M — the postpay CTE
-    under-reconstructs once weeks of payments separate the run from the
-    as-of date. Mike's own refreshed tabs keep the historical balances
-    (his May tab: closed rows still carry May-31 L) and only gain the
-    close dates, so that's the contract."""
-    log(f"[priorAr] pulling Date Closed for invoices open at {asof}")
-    raw = mcp.rows(q_ar(asof), "prior AR close dates")
-    out: dict[str, int] = {}
-    for r in raw:
-        key = norm_docno(g(r, 4))
-        cs = serial(g(r, 12))
-        if key and isinstance(cs, int):
-            out[key] = cs
-    log(f"[priorAr] {len(raw)} lines -> {len(out)} documents with a close date")
-    return out
+def _norm_type(v) -> str:
+    """Tab col G / BUILTIN.DF(t.type): 'Invoice', 'Credit Memo', 'Cash Sale'."""
+    return str(v or "").strip().casefold()
 
 
-def enrich_prior_rows(rows: list[list], close_map: dict[str, int]) -> int:
+def fetch_prior_closedates(mcp: Mcp, docnos: set[str],
+                           log=print) -> tuple[dict, dict]:
+    """Close dates for the given document numbers — the enrichment feed for
+    the prior-tab refresh. Returns ({(type, docno) -> serial}, {docno ->
+    serial}); the typed map disambiguates docno collisions (LIVE-VERIFIED
+    2026-08-25: tranid 180249 is simultaneously a 2014 invoice, a 2015
+    sales order and a 2026 credit memo), the doc-only map is the fallback
+    when the tab's type label doesn't match.
+
+    The previous version queried q_ar(asof) — i.e. only invoices still OPEN
+    at the as-of date — so anything whose closedate landed ON or BEFORE
+    month end was invisible and its T got cleared. Mike's 2026-08-25 review
+    listed 12 such documents (Paid in Full / Fully Applied in NS, blank T
+    in the delivered tab); every one has closedate <= asof. The fix keys
+    the pull on the tab's own document numbers with NO open filter.
+
+    Deliberately still NOT a data re-pull: the tab's pasted L values (the
+    as-of balances Mike closed the month on) stay untouched as ground
+    truth (see v30 — q_ar's reconstructed balances drift at a distance)."""
+    nos = sorted(n for n in docnos if n)
+    log(f"[priorAr] pulling Date Closed for {len(nos)} tab document numbers")
+    typed: dict[tuple[str, str], int] = {}
+    by_doc: dict[str, int] = {}
+    BATCH = 400
+    for i in range(0, len(nos), BATCH):
+        batch = nos[i:i + BATCH]
+        inlist = ", ".join("'" + n.replace("'", "''") + "'" for n in batch)
+        q = f"""
+SELECT t.tranid AS c01, BUILTIN.DF(t.type) AS c02, t.closedate AS c03
+FROM transaction t
+WHERE t.type IN ({sql_list(TXN_TYPES)})
+  AND t.trandate >= TO_DATE('{AR_HISTORY_START}','YYYY-MM-DD')
+  AND t.closedate IS NOT NULL
+  AND t.tranid IN ({inlist})
+ORDER BY t.id
+""".strip()
+        for r in mcp.rows(q, f"close dates {i + 1}-{i + len(batch)}"):
+            key = norm_docno(g(r, 1))
+            cs = serial(g(r, 3))
+            if not key or not isinstance(cs, int):
+                continue
+            tk = (_norm_type(g(r, 2)), key)
+            # same doc closed twice in-window: keep the LATEST close
+            if cs > typed.get(tk, -1):
+                typed[tk] = cs
+            if cs > by_doc.get(key, -1):
+                by_doc[key] = cs
+    log(f"[priorAr] {len(by_doc)} documents carry a close date")
+    return typed, by_doc
+
+
+def enrich_prior_rows(rows: list[list], typed: dict, by_doc: dict) -> int:
     """Overwrite each existing row's T (col 20, 'Date Closed') with the
-    VERIFIED close serial for its document number (col H), or clear it.
-    Clearing is load-bearing: the hand-pasted June tab carries 12,506
-    column-shift junk values in T (52, 60 — terms days) that spuriously
-    pass Dashboard E's '<serial' receipt cutoff. After this, T holds only
-    NetSuite-confirmed close dates. Returns the matched-row count."""
+    VERIFIED close serial for its (type, document number) — falling back
+    to document number alone — or clear it. Clearing is load-bearing: the
+    hand-pasted June tab carries column-shift junk values in T (52, 60 —
+    terms days) that spuriously pass Dashboard E's '<serial' receipt
+    cutoff. After this, T holds only NetSuite-confirmed close dates.
+    Returns the matched-row count."""
     hit = 0
     for row in rows:
-        cs = close_map.get(norm_docno(row[7]) or "")
+        doc = norm_docno(row[7]) or ""
+        cs = typed.get((_norm_type(row[6]), doc))
+        if cs is None:
+            cs = by_doc.get(doc)
         row[19] = cs
         if cs is not None:
             hit += 1
