@@ -463,6 +463,38 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
     del built["pasteRows"]
     results = s3.apply(dst)
     del s3
+    # stale-tab deletion runs on the PHASE-3 OUTPUT — only here is the Data
+    # tab rebuilt onto the new prior tab, so the reference guard sees the
+    # true final state. Its own mini-pass because the guard scans the
+    # surgeon's input file.
+    del_entries = [(e.get("sheet"), bool(e.get("optional")))
+                   if isinstance(e, dict) else (e, False)
+                   for e in (job.extract.get("deleteSheets") or [])]
+    if del_entries:
+        mid3 = os.path.join(WORK, f"{job_id}_mid3.xlsx")
+        os.replace(dst, mid3)
+        s4 = XlsxSurgeon(mid3, workdir=WORK)
+        for _nm, _opt in del_entries:
+            s4.delete_sheet(_nm, optional=_opt)
+        try:
+            results += s4.apply(dst)
+        except ValueError as e:
+            if "changed anything" not in str(e):
+                raise
+            # every delete skipped (all optional, all still referenced or
+            # absent) — the phase-3 output IS the final file
+            os.replace(mid3, dst)
+            results.append({"op": "delete_sheet",
+                            "sheet": ", ".join(n for n, _ in del_entries),
+                            "target": "workbook", "kind": "delete_sheet",
+                            "cellsChanged": 0,
+                            "skipped": "all delete targets skipped"})
+        else:
+            try:
+                os.remove(mid3)
+            except OSError:
+                pass
+        del s4
     for p in (p_main, p_prior, mid2):
         try:
             os.remove(p)
@@ -1103,13 +1135,18 @@ def _run(job_id: str, job: Job):
             # two-months-back tab frozen — which he then reviewed, confused.
             # extract.deleteSheets drops it. delete_sheet rides the finalize
             # pass, after the Dashboard retargets removed every reference.
-            for _e in (job.extract.get("deleteSheets") or []):
-                if isinstance(_e, dict):
-                    job.ops.append({"op": "delete_sheet",
-                                    "sheet": _e.get("sheet"),
-                                    "optional": bool(_e.get("optional"))})
-                else:
-                    job.ops.append({"op": "delete_sheet", "sheet": _e})
+            if not job.extract.get("dataTab"):
+                # no reporting phase -> deletes ride the finalize pass; with
+                # a reporting phase they run AFTER it (see
+                # _run_reporting_phase) because the OLD Data tab still
+                # references the tab being deleted until the rebuild lands
+                for _e in (job.extract.get("deleteSheets") or []):
+                    if isinstance(_e, dict):
+                        job.ops.append({"op": "delete_sheet",
+                                        "sheet": _e.get("sheet"),
+                                        "optional": bool(_e.get("optional"))})
+                    else:
+                        job.ops.append({"op": "delete_sheet", "sheet": _e})
             data_spec = job.extract.get("dataTab")
             if data_spec and job.extract.get("applyOps", True):
                 if not job.extract.get("priorAr"):
@@ -1347,7 +1384,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-08-25-v42-reviewfixes"
+VERSION = "2026-08-25-v43-delete-after-phase3"
 
 
 @app.get("/health")
