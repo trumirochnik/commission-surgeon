@@ -992,10 +992,31 @@ def _run(job_id: str, job: Job):
                      f"{os.path.getsize(src) if os.path.exists(src) else 0} bytes "
                      f"({de}); retrying", flush=True)
                 time.sleep(5 * attempts)
-        if job.fileSize and os.path.getsize(src) != job.fileSize:
-            raise ValueError(
-                f"download incomplete: got {os.path.getsize(src)} bytes, "
-                f"expected {job.fileSize} — refusing to operate on a truncated file")
+        got = os.path.getsize(src)
+        if job.fileSize and got != job.fileSize:
+            # SharePoint restamps Office files right after a copy, so the
+            # size n8n read at mint time can drift a few KB in EITHER
+            # direction by download time (seen live 2026-09-01: +2,995
+            # bytes — the old strict equality called it "truncated"). The
+            # byte count can't prove integrity; the zip's own structure
+            # can: parse the central directory and CRC-check every part.
+            try:
+                with zipfile.ZipFile(src) as zf:
+                    if "xl/workbook.xml" not in zf.namelist():
+                        raise ValueError("no xl/workbook.xml in the archive")
+                    bad = zf.testzip()
+                    if bad:
+                        raise ValueError(f"CRC failure in {bad}")
+            except Exception as ze:  # noqa: BLE001 — any failure = corrupt
+                raise ValueError(
+                    f"download incomplete: got {got} bytes, expected "
+                    f"{job.fileSize}, and the archive fails validation "
+                    f"({ze}) — refusing to operate on a corrupt download")
+            j["sizeDrift"] = (f"metadata said {job.fileSize}, downloaded "
+                              f"{got} — zip CRC-validated OK (SharePoint "
+                              "restamp)")
+            print(f"[dl] size drift {job.fileSize} -> {got}; "
+                  "zip CRC-validated OK", flush=True)
         j["downloadedMB"] = round(os.path.getsize(src) / 1048576, 1)
         _mem_checkpoint(j, "download")
         _persist_jobs()
@@ -1408,7 +1429,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-09-01-v44-cleandelete"
+VERSION = "2026-09-01-v45-sizedrift"
 
 
 @app.get("/health")
