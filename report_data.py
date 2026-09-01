@@ -326,6 +326,13 @@ def shadow_rate(partner, company, item_id, doc_no, f_serial,
     if u == consts["dayna"] and isinstance(f_serial, (int, float)) \
             and f_serial > consts["ad1"]:
         return " "
+    # Mike 2026-09-01 (Harmony): date-conditional promo rates — shipments
+    # BEFORE the cutoff use the promo rate; the SKU tab answers afterwards.
+    # Mirrors the branches inject_promo writes into the AR formulas.
+    pr = (consts.get("promo") or {}).get(
+        str(item_id).strip() if item_id is not None else "")
+    if pr and isinstance(f_serial, (int, float)) and f_serial < pr[1]:
+        return pr[0]
     sr = sku_rates.get(str(item_id).strip() if item_id is not None else "")
     if isinstance(sr, (int, float)):
         return sr

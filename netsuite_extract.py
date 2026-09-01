@@ -625,12 +625,13 @@ def build_ar_rows(raw: list[dict], cust: dict[str, dict],
         if company and company in EXCLUDED_COMPANIES:
             skipped_company += 1
             continue
-        # Mike/Preet review 2026-08-25: exclude rows whose PRIMARY partner is
-        # the literal partner record "None" (Target/Walmart-style house
-        # accounts — no commission, ~half the sales rows, most of the file
-        # size). BLANK primary partner stays in for now, per Mike.
+        # Mike/Preet 2026-08-25 + 2026-09-01: exclude rows whose PRIMARY
+        # partner is the literal record "None"; the AR report additionally
+        # drops BLANK primary partners (their 0901 follow-up — "not included
+        # in the commission calculations"). Sales keeps blanks.
         primary = _dim_lookup(c, "partner")
-        if isinstance(primary, str) and primary.strip().casefold() == "none":
+        if (primary is None or str(primary).strip() == ""
+                or str(primary).strip().casefold() == "none"):
             skipped_none += 1
             continue
         # AR is Romane-scoped, and only these store types are commissionable.
@@ -710,9 +711,8 @@ def build_sales_rows(raw: list[dict], cust: dict[str, dict],
             skipped_company += 1
             continue
         # Mike/Preet review 2026-08-25: exclude rows whose PRIMARY partner is
-        # the literal partner record "None" (Target/Walmart-style house
-        # accounts — no commission, ~half the sales rows, most of the file
-        # size). BLANK primary partner stays in for now, per Mike.
+        # the literal partner record "None". BLANK stays in on the SALES
+        # side (the 0901 blank exclusion was asked for the AR reports).
         primary = _dim_lookup(c, "partner")
         if isinstance(primary, str) and primary.strip().casefold() == "none":
             skipped_none += 1
@@ -858,8 +858,41 @@ def col_to_index(col: str) -> int:
     return n
 
 
+_SKU_VLOOKUP = "VLOOKUP(I{r},'Commission Rate by SKUs'!B:E,4,0)"
+
+
+def normalize_promo(raw) -> list[tuple[int, float, float, int]]:
+    """extract.promoRates -> [(sku, preRate, postRate, cutoffSerial)].
+    Mike 2026-09-01 (Harmony launch): shipments BEFORE the cutoff use the
+    promo rate; everything else falls through to the SKU tab (which the
+    run normalizes to the post rate)."""
+    out = []
+    for e in (raw or []):
+        cut = e.get("cutoffDate")
+        cs = serial(cut) if not isinstance(cut, (int, float)) else int(cut)
+        if not isinstance(cs, int):
+            raise ValueError(f"promoRates: bad cutoffDate {cut!r}")
+        out.append((int(e["sku"]), float(e["pre"]), float(e["post"]), cs))
+    return out
+
+
+def inject_promo(tpl: str, promo) -> str:
+    """Wrap the SKU-tab VLOOKUP in date-conditional promo branches —
+    Mike's own AR-tab edit, adopted with the LOCAL tab reference (his
+    Excel session rebound the lookup to an external '[1]' workbook).
+    Entries whose pre == post need no branch (tab already answers)."""
+    branched = [(s, pre, cut) for s, pre, post, cut in promo if pre != post]
+    if not branched or _SKU_VLOOKUP not in tpl:
+        return tpl
+    inner = _SKU_VLOOKUP
+    for sku, pre, cut in reversed(branched):
+        inner = f"IF(AND(I{{r}}={sku},F{{r}}<{cut}),{pre:g},{inner})"
+    return tpl.replace(_SKU_VLOOKUP, inner)
+
+
 def formula_cells(kind: str, first_row: int, count: int,
-                  prior_ar_tab: str | None = None) -> dict[str, str]:
+                  prior_ar_tab: str | None = None,
+                  promo=None) -> dict[str, str]:
     """{'Z7': '=V7-L7', 'Z8': ...} for a set_cells op, or fold into paste rows.
 
     prior_ar_tab fills the AR 'AD'/'AG' XLOOKUP templates' {prior_ar_tab}
@@ -868,6 +901,7 @@ def formula_cells(kind: str, first_row: int, count: int,
     month's prior tab."""
     out: dict[str, str] = {}
     for tpl_col, tpl in FORMULA_TEMPLATES.get(kind, {}).items():
+        tpl = inject_promo(tpl, promo or [])
         if "{prior_ar_tab}" in tpl and not prior_ar_tab:
             raise ValueError(
                 f"{kind!r} template {tpl_col!r} needs prior_ar_tab but none was given")
@@ -1026,10 +1060,12 @@ PRIOR_FORMULA_TEMPLATES: dict[str, str] = {
 }
 
 
-def prior_formula_cells(first_row: int, count: int) -> dict[str, str]:
+def prior_formula_cells(first_row: int, count: int,
+                        promo=None) -> dict[str, str]:
     out: dict[str, str] = {}
-    for rn in range(first_row, first_row + count):
-        for col, tpl in PRIOR_FORMULA_TEMPLATES.items():
+    for col, tpl in PRIOR_FORMULA_TEMPLATES.items():
+        tpl = inject_promo(tpl, promo or [])
+        for rn in range(first_row, first_row + count):
             out[f"{col}{rn}"] = tpl.replace("{r}", str(rn))
     return out
 

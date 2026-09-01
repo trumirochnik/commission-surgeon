@@ -364,6 +364,11 @@ def _run_reporting_phase(job_id: str, job: Job, data_spec: dict,
     licensed_ids = {str(v["B"]).strip() for v in sku.values()
                     if v.get("B") is not None}
     consts = _shadow_consts(src, prior_tab)
+    from netsuite_extract import normalize_promo as _np3
+    _promo = _np3(job.extract.get("promoRates"))
+    for _sku, _pre, _post, _cut in _promo:
+        sku_rates[str(_sku)] = _post          # tab answers post-cutoff
+    consts["promo"] = {str(s): (p, c) for s, p, po, c in _promo if p != po}
     combos, undetermined = rd.distinct_combos(
         prior_rows, main["ar"], main["sales"], sku_rates, licensed_ids, consts)
 
@@ -1155,6 +1160,7 @@ def _run(job_id: str, job: Job):
                     _log(f"[priorAr] L2 freeze skipped: {_e}")
                 bal = round(sum(r[11] for r in prows
                                 if isinstance(r[11], (int, float))), 2)
+                prior_spec["promoRates"] = job.extract.get("promoRates")
                 pops, preport = build_prior_ops(
                     prows, prior_spec, _serial(prior_spec["asofDate"]))
                 import pickle
@@ -1175,6 +1181,34 @@ def _run(job_id: str, job: Job):
             # reporting half: stash the row-sets on DISK for phase 3 — the
             # Data-tab ops (~46k rows + formula cells) are built only when
             # that phase runs, so phases 1-2 never hold them in memory
+            # Mike 2026-09-01 (Harmony): the SKU tab must answer the
+            # POST-cutoff rate — the generated formulas carry the promo
+            # branches for pre-cutoff shipments. Normalize the output's tab
+            # to each promo entry's post rate (diff-aware: a source already
+            # carrying the right value writes nothing).
+            _praw = job.extract.get("promoRates")
+            if _praw:
+                from netsuite_extract import normalize_promo as _np
+                _sku_rows = _read_sheet_cols(src, "Commission Rate by SKUs",
+                                             ["B", "E"], 2)
+                _by_sku = {}
+                for _rn, _v in _sku_rows.items():
+                    if _v.get("B") is not None:
+                        _by_sku.setdefault(str(_v["B"]).strip(), _rn)
+                _fix = {}
+                for _sku, _pre, _post, _cut in _np(_praw):
+                    _rn = _by_sku.get(str(_sku))
+                    if _rn is None:
+                        raise ValueError(
+                            f"promoRates: SKU {_sku} not found on "
+                            "'Commission Rate by SKUs' — add it there first")
+                    if _sku_rows[_rn].get("E") != _post:
+                        _fix[f"E{_rn}"] = _post
+                if _fix:
+                    job.ops.append({"op": "set_cells",
+                                    "sheet": "Commission Rate by SKUs",
+                                    "cells": _fix})
+                j["promoTabRates"] = {k: v for k, v in _fix.items()} or "already normalized"
             # Mike/Preet 2026-08-25: his manual flow RECYCLES two AR tabs
             # (paste-over + rename); ours added a third and left the
             # two-months-back tab frozen — which he then reviewed, confused.
@@ -1429,7 +1463,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-09-01-v46-newitems-retry"
+VERSION = "2026-09-01-v47-0901review"
 
 
 @app.get("/health")

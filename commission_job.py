@@ -59,7 +59,8 @@ def _pad(rows: list[list], width: int) -> list[list]:
 
 
 def _formula_cells(kind: str, first_row: int, count: int,
-                   prior_ar_tab: str | None = None) -> dict[str, str]:
+                   prior_ar_tab: str | None = None,
+                   promo=None) -> dict[str, str]:
     """{'Z7': '=V7-L7', ...} for the rows we just wrote.
 
     Only templates present in FORMULA_TEMPLATES are emitted. Columns with no
@@ -68,7 +69,7 @@ def _formula_cells(kind: str, first_row: int, count: int,
     real gap, reported by build_ops() as `formulaGaps`.
     """
     from netsuite_extract import formula_cells as _fc
-    return _fc(kind, first_row, count, prior_ar_tab=prior_ar_tab)
+    return _fc(kind, first_row, count, prior_ar_tab=prior_ar_tab, promo=promo)
 
 
 def _span_cols(span: str) -> list[str]:
@@ -105,6 +106,8 @@ def build_ops(data: dict, spec: dict, prior_ar_tab: str | None = None
     """
     ops: list[dict] = []
     report: dict[str, Any] = {"formulaGaps": {}, "rowCounts": {}}
+    from netsuite_extract import normalize_promo
+    promo = normalize_promo(spec.get("promoRates"))
 
     ar_rows = data["arRows"]
     sales_rows = data["salesRows"]
@@ -115,7 +118,8 @@ def build_ops(data: dict, spec: dict, prior_ar_tab: str | None = None
     ops.append({"op": "paste_columns", "sheet": ar["target"],
                 "anchor": ar["anchor"], "rows": _pad(ar_rows, AR_DATA_COLS),
                 "clear_beyond": True})
-    cells = _formula_cells("ar", ar_first, len(ar_rows), prior_ar_tab=prior_ar_tab)
+    cells = _formula_cells("ar", ar_first, len(ar_rows),
+                           prior_ar_tab=prior_ar_tab, promo=promo)
     if cells:
         ops.append({"op": "set_cells", "sheet": ar["target"], "cells": cells})
     have = set(re.match(r"^([A-Z]+)", k).group(1) for k in cells)
@@ -129,7 +133,7 @@ def build_ops(data: dict, spec: dict, prior_ar_tab: str | None = None
     ops.append({"op": "paste_columns", "sheet": sl["target"],
                 "anchor": sl["anchor"], "rows": _pad(sales_rows, SALES_DATA_COLS),
                 "clear_beyond": True})
-    cells = _formula_cells("sales", sl_first, len(sales_rows))
+    cells = _formula_cells("sales", sl_first, len(sales_rows), promo=promo)
     if cells:
         ops.append({"op": "set_cells", "sheet": sl["target"], "cells": cells})
     have = set(re.match(r"^([A-Z]+)", k).group(1) for k in cells)
@@ -172,13 +176,31 @@ def build_prior_ops(rows: list[list], spec: dict, asof_serial: int
     which the streaming rebuild writes into the prefix). Rows past the new
     extent are dropped by the stream — including the hand-paste's shifted
     junk rows whose stale T values spuriously passed the receipt cutoff."""
-    from netsuite_extract import prior_formula_cells, prior_value_cells
+    from netsuite_extract import (prior_formula_cells, prior_value_cells,
+                                  normalize_promo, EXCEL_EPOCH)
+    import datetime as _dt
     target = spec["target"]
     anchor = spec.get("anchor", "A7")
     first = _anchor_row(anchor)
+    promo = normalize_promo(spec.get("promoRates"))
     cells: dict[str, object] = {}
-    cells.update(prior_formula_cells(first, len(rows)))
+    cells.update(prior_formula_cells(first, len(rows), promo=promo))
     cells.update(prior_value_cells(rows, first, asof_serial))
+    # Mike 2026-09-01 item 3: the conversion rewrites AA:AH's CONTENT to the
+    # prior layout but the inherited row-6 labels still described the
+    # current layout — he hand-corrected them; now the conversion writes
+    # matching labels (month names derived from the as-of date).
+    pd = EXCEL_EPOCH + _dt.timedelta(days=int(asof_serial))
+    rm, ry = (pd.month % 12) + 1, pd.year + (1 if pd.month == 12 else 0)
+    _FULL = ("January", "February", "March", "April", "May", "June", "July",
+             "August", "September", "October", "November", "December")
+    cells.update({
+        "AA6": "Deposit Month", "AB6": "Client Age",
+        "AC6": "Deposit Month(In number)", "AD6": "Commission Rate",
+        "AE6": f"{_FULL[pd.month - 1]}'{pd.year % 100} Unearned Commission",
+        "AF6": f"Commission earned on {_FULL[rm - 1]}'{ry % 100} receipts",
+        "AG6": "Concatenation No. & Item", "AH6": " ",
+    })
     for ref, val in (spec.get("headerCells") or {}).items():
         cells[ref] = val
     ops = [

@@ -43,11 +43,12 @@ CUST = {"1": cust_entry("None"),            # literal partner record "None"
 raw = [raw_row("1"), raw_row("2"), raw_row("3"), raw_row("4")]
 
 ar, ar_stats = build_ar_rows(raw, CUST, {}, {}, {}, {}, sign_flip=True)
-check("A1: AR keeps blank + named, drops both None variants",
-      len(ar) == 2 and {r[20] for r in ar} == {None, "Tiffany McDaniel"},
+# Mike 2026-09-01 follow-up: AR also drops BLANK primary partners
+check("A1: AR keeps only named partners (blanks + None dropped, 0901 rule)",
+      len(ar) == 1 and {r[20] for r in ar} == {"Tiffany McDaniel"},
       [(r[20]) for r in ar])
 check("A2: AR stats count the exclusions",
-      ar_stats["skipped_primary_none"] == 2, ar_stats)
+      ar_stats["skipped_primary_none"] == 3, ar_stats)
 
 sales, s_stats = build_sales_rows(raw, CUST, {}, {}, 46234, sign_flip=True)
 check("S1: sales same rule", len(sales) == 2
