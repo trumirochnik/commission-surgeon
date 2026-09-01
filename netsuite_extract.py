@@ -54,6 +54,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any, Iterable
 
 import requests
@@ -511,18 +512,50 @@ HAVING MIN(t.trandate) >= TO_DATE('{frm}','YYYY-MM-DD')
 ORDER BY i.itemid
 """.strip()
 
+    def _rows_retry(q, label, tries=3):
+        """The first-fulfillment scan aggregates ALL fulfillment history and
+        times out under NetSuite load (live 2026-09-01: both bases failed,
+        the run shipped an EMPTY proposals list labeled unavailable — which
+        the checklist presents as 'nothing to approve'). Timeouts get
+        backoff retries; anything else raises immediately."""
+        for a in range(1, tries + 1):
+            try:
+                return mcp.rows(q, label)
+            except McpError as e:
+                if a == tries or "timeout" not in str(e).lower():
+                    raise
+                log(f"[newitems] {label}: NetSuite timeout "
+                    f"(attempt {a}/{tries}) — backing off")
+                time.sleep(12 * a)
+
     for kinds, basis in (("'ItemShip'", "item_fulfillment"),
                          (sql_list(TXN_TYPES), "first_sale_fallback")):
         try:
             shipped = [str(g(r, 1)) for r in
-                       mcp.rows(q_shipped(kinds), f"new items sweep ({basis})")]
+                       _rows_retry(q_shipped(kinds), f"new items sweep ({basis})")]
             log(f"[newitems] {len(shipped)} SKUs moved in period ({basis})")
             firsts: list[tuple[str, str]] = []
-            for batch in chunks(shipped, ID_BATCH):
-                for r in mcp.rows(q_first(kinds, batch), "new items first-date"):
-                    d = to_date(g(r, 2))
-                    firsts.append((str(g(r, 1)), d.isoformat() if d else str(g(r, 2))))
+            batches = list(chunks(shipped, 100))   # small batches scan cheaper
+            failed = 0
+            for bi, batch in enumerate(batches):
+                try:
+                    for r in _rows_retry(q_first(kinds, batch),
+                                         f"new items first-date "
+                                         f"{bi + 1}/{len(batches)}"):
+                        d = to_date(g(r, 2))
+                        firsts.append((str(g(r, 1)),
+                                       d.isoformat() if d else str(g(r, 2))))
+                except McpError as e:
+                    failed += 1
+                    log(f"[newitems] batch {bi + 1}/{len(batches)} failed "
+                        f"after retries: {str(e)[:100]}")
+            if batches and failed == len(batches):
+                raise McpError("every first-date batch timed out")
             log(f"[newitems] {len(firsts)} first-fulfilled inside period")
+            if failed:
+                # a missed batch can HIDE a new item — say so, loudly
+                return firsts, (f"{basis} (PARTIAL: {failed}/{len(batches)} "
+                                "batches timed out — list may be incomplete)")
             return firsts, basis
         except McpError as e:
             log(f"[newitems] {basis} query failed ({str(e)[:120]}) — "

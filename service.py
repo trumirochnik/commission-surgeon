@@ -1429,7 +1429,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-09-01-v45-sizedrift"
+VERSION = "2026-09-01-v46-newitems-retry"
 
 
 @app.get("/health")
