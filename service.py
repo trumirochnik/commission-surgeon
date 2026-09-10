@@ -603,6 +603,35 @@ def _build_statements_zip(job_id: str, src: str, spec: dict, j: dict) -> str:
     return zpath
 
 
+def _read_dashboard_partner_rows(path: str, sheet: str = "Dashboard",
+                                 col: str = "B", first: int = 6,
+                                 last: int = 24) -> dict[str, int]:
+    """{partner name -> Dashboard row} from the SOURCE book's partner
+    table (B6:B24), read before any op runs. Feeds the credit-memo
+    receipts adjustment, which must address each rep's own E formula."""
+    s = XlsxSurgeon(path, workdir=WORK)
+    part = s._sheet_parts.get(sheet)
+    if not part:
+        raise ValueError(f"sheet {sheet!r} not found")
+    with zipfile.ZipFile(path) as zf:
+        rows = xr.stream_rows(zf, part, first, last)
+        need = set()
+        for rc in rows.values():
+            need |= xr.shared_indices(rc.values())
+        shared = xr.resolve_shared(zf, need)
+    out: dict[str, int] = {}
+    for rn, cells in rows.items():
+        cell = cells.get(col)
+        if not cell:
+            continue
+        v = xr.cell_value(cell, shared)
+        if isinstance(v, str) and v.strip():
+            out[v.strip()] = int(rn)
+    if not out:
+        raise ValueError(f"no partner names read from {sheet}!{col}{first}:{col}{last}")
+    return out
+
+
 def _run_read_ranges(path: str, specs: list[dict], j: dict) -> None:
     """Read requested ranges from the FINISHED output (after ops), resolving
     shared strings, and expose them keyed by their 'as' names. Values are
@@ -1080,6 +1109,26 @@ def _run(job_id: str, job: Job):
                           if o.get("op") == "duplicate_sheet"), None)
             prior_ar_tab = dup_op["source"] if dup_op else None
             gen_ops, report = build_ops(data, job.extract, prior_ar_tab=prior_ar_tab)
+            # SOP 'Reconcile and Validate' (Preet 2026-09-10): credit memos
+            # dated in-period but applied to a prior period go onto the
+            # rep's receipts as the trailing E constant Mike types by hand.
+            # Lands in the 'sales' pass, AFTER the caller's strip of last
+            # month's constants (ar_dashboard pass), so the regex sees a
+            # clean `+Hn` tail. Failure here degrades to the manual
+            # behaviour and is reported — never fatal.
+            if job.extract.get("creditMemoAdjustments", True):
+                try:
+                    from commission_job import credit_memo_adjustments
+                    from netsuite_extract import serial as _serial_date
+                    prow = _read_dashboard_partner_rows(src)
+                    cm_ops, cm_report = credit_memo_adjustments(
+                        data["salesRows"], _serial_date(job.extract["fromDate"]), prow)
+                    gen_ops.extend(cm_ops)
+                    cm_report["partnerRowsRead"] = len(prow)
+                    j["creditMemoAdjustments"] = cm_report
+                except Exception as ce:  # noqa: BLE001
+                    j["creditMemoAdjustments"] = {"error": str(ce)[:400],
+                                                  "note": "not applied — add E constants by hand"}
             j.update(
                 arRows=data["arCount"], salesRows=data["salesCount"],
                 arOpenBalance=data["arOpenBalance"], txnCount=data["txnCount"],
@@ -1469,7 +1518,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-09-10-v49-ar-no-cashsale"
+VERSION = "2026-09-10-v50-creditmemo-receipts"
 
 
 @app.get("/health")

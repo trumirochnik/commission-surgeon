@@ -182,6 +182,74 @@ def build_ops(data: dict, spec: dict, prior_ar_tab: str | None = None
     return ops, report
 
 
+def credit_memo_adjustments(sales_rows: list[list], period_start_serial: int,
+                            partner_rows: dict[str, int],
+                            dashboard: str = "Dashboard") -> tuple[list[dict], dict]:
+    """SOP 'Reconcile and Validate', automated (Preet, 2026-09-10).
+
+    The most common Dashboard J variance is a credit memo DATED in the
+    period but APPLIED to a prior-period invoice: it lands in August
+    billing (D) but its deposit month is July or earlier, so the receipts
+    column (E) never sees it and J is off by exactly its amount. Mike's
+    fix is a trailing constant on that rep's E formula (`+H8-24`); the
+    hand-built 08.2026 book carries `+H8-24` (Kevin, CM 180346 closed
+    7/30) and `+H21-17.5` (Kelly, CM 180351 closed in June). Preet: "if
+    it's applied, we would like it reflected on those reps' receipts."
+
+    Rule: every sales row of type Credit Memo whose Date Closed (T) is
+    before the period start contributes its gross amount (V, already
+    sign-flipped) to its Primary Partner's receipts. Emitted as ONE
+    replace_formula_text op on the Dashboard: regex `(\\+H<row>)$` ->
+    `\\1<±amount>`, i.e. exactly the accountant's constant, appended to
+    the formula's trailing +H term. Next month's roll strips it again
+    with the existing `(\\+H\\d+)(?:[-+][0-9]+(?:\\.[0-9]+)?)+$` mapping,
+    so the adjustment lives for one book only — same lifecycle as the
+    hand-typed version. Mappings are optional: a partner row whose E has
+    no +H term (Dayna's blank row) is reported, not fatal.
+
+    Row layout is the 25-col sales block: G=type (6), H=doc (7), I=item
+    (8), T=Date Closed (19), U=Primary Partner (20), V=Amount Gross (21).
+    """
+    by_partner: dict[str, dict] = {}
+    for r in sales_rows:
+        if str(r[6] or "").strip().casefold() != "credit memo":
+            continue
+        t = r[19]
+        if isinstance(t, bool) or not isinstance(t, (int, float)):
+            continue
+        if t >= period_start_serial:
+            continue            # applied inside the period: normal receipt
+        v = r[21]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v == 0:
+            continue
+        partner = str(r[20] or "").strip()
+        e = by_partner.setdefault(partner, {"amount": 0.0, "items": []})
+        e["amount"] += float(v)
+        e["items"].append({"doc": str(r[7]), "item": str(r[8]),
+                           "closedSerial": int(t), "amount": round(float(v), 2)})
+    replace: list[dict] = []
+    report: dict[str, Any] = {"applied": [], "unmatchedPartners": [],
+                              "rule": "credit memos dated in-period, closed before period start -> receipts"}
+    for partner, e in sorted(by_partner.items()):
+        amt = round(e["amount"], 2)
+        if abs(amt) < 0.005:
+            continue
+        row = partner_rows.get(partner)
+        entry = {"partner": partner, "amount": amt, "items": e["items"]}
+        if row is None:
+            report["unmatchedPartners"].append(entry)
+            continue
+        const = f"{'-' if amt < 0 else '+'}{abs(amt):.2f}"
+        replace.append({"from": rf"(\+H{row})$", "to": rf"\g<1>{const}",
+                        "regex": True, "optional": True})
+        entry["row"] = row
+        entry["formulaSuffix"] = const
+        report["applied"].append(entry)
+    ops = ([{"op": "replace_formula_text", "sheet": dashboard, "replace": replace}]
+           if replace else [])
+    return ops, report
+
+
 def build_prior_ops(rows: list[list], spec: dict, asof_serial: int
                     ) -> tuple[list[dict], dict]:
     """Ops for the prior-tab refresh (see extract_prior_ar): re-paste the
