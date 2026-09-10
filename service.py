@@ -1086,6 +1086,9 @@ def _run(job_id: str, job: Job):
                 extractDiagnostics=data["diagnostics"], opsReport=report,
                 newItems=data.get("newItems", []),
                 newItemsBasis=data.get("newItemsBasis"),
+                paymentDateSource=data["diagnostics"].get("paymentDateSource"),
+                typeVisibility=data["diagnostics"].get("visibility"),
+                postAsofAddBack=data["diagnostics"].get("postpay"),
             )
             if data["arCount"] < 1000 or data["salesCount"] < 100:
                 raise ValueError(
@@ -1102,7 +1105,7 @@ def _run(job_id: str, job: Job):
                 _ar_t = (job.extract.get("ar") or {}).get("target")
                 spill = {"p1": [], "sales": [], "raw": []}
                 for op in gen_ops:
-                    if op["op"] == "append_rows":
+                    if op["op"] in ("append_rows", "trim_rows"):
                         spill["raw"].append(op)
                     elif op.get("sheet") == _ar_t:
                         spill["p1"].append(op)
@@ -1272,6 +1275,9 @@ def _run(job_id: str, job: Job):
                     surgeon.set_cells(op["sheet"], op["cells"])
                 elif kind == "append_rows":
                     surgeon.append_rows(op["sheet"], op["rows"])
+                elif kind == "trim_rows":
+                    surgeon.trim_rows(op["sheet"], op["col"], op["minValue"],
+                                      op["firstRow"])
                 elif kind == "add_sheet":
                     surgeon.add_sheet(op["name"], op["rows"])
                 elif kind == "duplicate_sheet":
@@ -1463,7 +1469,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-09-01-v47-0901review"
+VERSION = "2026-09-10-v48-aug-parallel-fixes"
 
 
 @app.get("/health")

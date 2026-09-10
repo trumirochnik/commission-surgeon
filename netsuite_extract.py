@@ -105,7 +105,17 @@ STORE_TYPES = (
 )
 ITEM_TYPES = ("Assembly", "Discount", "InvtPart")
 TXN_TYPES = ("CustInvc", "CashSale", "CustCred")
-AR_HISTORY_START = "2022-10-01"
+# Lower bound on the AR pull's trandate. 2022-10-01 dropped a still-OPEN
+# 2022-09-07 credit memo (179025, Tiffany, -22.50) that the hand-built
+# 08.2026 book carries — the only listed-partner document older than the
+# window in that book (live: 2,978 open docs predate 2022-10, all but that
+# one blank-partner). Widened to cover it; a NetSuite aging report has no
+# such bound at all.
+AR_HISTORY_START = "2022-01-01"
+# NextTransactionLineLink next-types that reduce an invoice's balance and
+# therefore count toward the post-as-of add-back (live census 08.2026 on
+# invoices closed after month-end: CustPymt 243, Journal 24, CustCred 8).
+POSTPAY_LINK_TYPES = ("CustPymt", "Journal", "CustCred", "DepAppl")
 
 
 # ─────────────────────────── MCP client ───────────────────────────
@@ -259,21 +269,142 @@ def sql_list(vals: Iterable[str]) -> str:
 
 # ─────────────────────────── queries ───────────────────────────
 
-def q_ar(asof: str) -> str:
-    """AR aging detail, open as of `asof`.
+def _postpay_cte(asof: str, boundary_id: int | None) -> str:
+    """The post-as-of payment add-back, shared by q_ar and the check query.
 
-    Rule 1 supplies the open-at-as-of test. The as-of BALANCE is the header's
-    current unpaid amount plus anything paid AFTER as-of (a small bounded CTE —
-    ~3,328 docs — not the unbounded one that hangs), prorated across lines.
-    """
-    return f"""
+    Legacy shape (boundary_id None): JOIN the applying transaction and test
+    its trandate. That silently matched NOTHING on the 08.2026 run — the
+    integration role has no View on Customer Payment, so `pt` was never
+    visible for a payment link — and every payment applied between month
+    end and run day was reported as collected in the month (632 lines /
+    $122K; Kevin's 1163757 closed 9/3 shown paid at 8/31).
+
+    Proxy shape: the LINK rows are visible even when the payment record is
+    not, and NetSuite ids are creation-ordered. With `boundary_id` = MAX(id)
+    of anything created before the following month, a link whose record is
+    invisible counts as post-as-of when its id is above the boundary.
+    Visible records (journals, credit memos, and payments once the
+    permission exists) still use their real trandate — the proxy only
+    fills the gap. Proven 08.2026: 130 of 131 disputed invoices matched
+    the hand-built book (the miss: one payment created in August, dated
+    September)."""
+    if boundary_id is None:
+        return f"""
 WITH postpay AS (
   SELECT ntll.previousdoc AS tid, SUM(NVL(ntll.foreignamount,0)) AS post_amt
   FROM NextTransactionLineLink ntll
   JOIN transaction pt ON pt.id = ntll.nextdoc
   WHERE pt.trandate > TO_DATE('{asof}','YYYY-MM-DD')
   GROUP BY ntll.previousdoc
-)
+)""".strip()
+    return f"""
+WITH postpay AS (
+  SELECT ntll.previousdoc AS tid, SUM(NVL(ntll.foreignamount,0)) AS post_amt
+  FROM NextTransactionLineLink ntll
+  LEFT JOIN transaction pt ON pt.id = ntll.nextdoc
+  WHERE ntll.nexttype IN ({sql_list(POSTPAY_LINK_TYPES)})
+    AND (pt.trandate > TO_DATE('{asof}','YYYY-MM-DD')
+         OR (pt.trandate IS NULL AND ntll.nextdoc > {int(boundary_id)}))
+  GROUP BY ntll.previousdoc
+)""".strip()
+
+
+def next_month_start(asof: str) -> str:
+    """'2026-08-31' -> '2026-09-01' (the id-boundary cutoff instant)."""
+    d = to_date(asof)
+    if d is None:
+        raise ValueError(f"bad as-of date {asof!r}")
+    y, m = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+    return f"{y:04d}-{m:02d}-01"
+
+
+def q_boundary_id(next_start: str) -> str:
+    """Highest transaction id created before `next_start` — anything with a
+    larger id was created in the following month or later. Live 08.2026:
+    29,910,297 (last August-created) vs 29,910,396 (first September)."""
+    return f"""
+SELECT MAX(t.id) AS c01
+FROM transaction t
+WHERE t.createddate < TO_DATE('{next_start}','YYYY-MM-DD')
+""".strip()
+
+
+def fetch_boundary_id(mcp: "Mcp", asof: str, log=print) -> int:
+    ns = next_month_start(asof)
+    rows = mcp.rows(q_boundary_id(ns), "id boundary")
+    v = num(g(rows[0], 1)) if rows else None
+    if not isinstance(v, float) or v <= 0:
+        raise ValueError(f"could not determine the transaction-id boundary "
+                         f"before {ns} (got {v!r}) — refusing to run the AR "
+                         "pull without a post-as-of payment test")
+    log(f"[ar] id boundary before {ns}: {int(v)}")
+    return int(v)
+
+
+VISIBILITY_TYPES = ("CustInvc", "CashSale", "CustCred", "CustPymt")
+
+
+def q_visibility(frm: str, to: str) -> str:
+    """Transaction-type census for the period. NetSuite returns an EMPTY set,
+    not an error, for record types the role may not View — so a type that
+    exists every month coming back with no rows is the permission signal.
+    08.2026: CashSale and CustPymt were both absent for ALL of 2026."""
+    return f"""
+SELECT t.type AS c01, COUNT(*) AS c02
+FROM transaction t
+WHERE t.type IN ({sql_list(VISIBILITY_TYPES)})
+  AND t.trandate BETWEEN TO_DATE('{frm}','YYYY-MM-DD') AND TO_DATE('{to}','YYYY-MM-DD')
+GROUP BY t.type
+ORDER BY t.type
+""".strip()
+
+
+def fetch_visibility(mcp: "Mcp", frm: str, to: str, log=print) -> dict[str, int]:
+    vis = {t: 0 for t in VISIBILITY_TYPES}
+    for r in mcp.rows(q_visibility(frm, to), "type visibility"):
+        n = num(g(r, 2))
+        vis[str(g(r, 1))] = int(n) if isinstance(n, float) else 0
+    log(f"[gate] type visibility {frm}..{to}: "
+        + ", ".join(f"{k}={v}" for k, v in vis.items()))
+    return vis
+
+
+def q_postpay_check(asof: str, boundary_id: int) -> str:
+    """How much the add-back actually contributes: invoices open at as-of
+    that carry any post-as-of application, and the total added back."""
+    return f"""
+{_postpay_cte(asof, boundary_id)}
+SELECT COUNT(*) AS c01, SUM(pp.post_amt) AS c02
+FROM transaction t
+JOIN postpay pp ON pp.tid = t.id
+WHERE t.type = 'CustInvc'
+  AND t.trandate <= TO_DATE('{asof}','YYYY-MM-DD')
+  AND (t.closedate IS NULL OR t.closedate > TO_DATE('{asof}','YYYY-MM-DD'))
+""".strip()
+
+
+def fetch_postpay_check(mcp: "Mcp", asof: str, boundary_id: int,
+                        log=print) -> dict:
+    rows = mcp.rows(q_postpay_check(asof, boundary_id), "post-asof add-back check")
+    n = num(g(rows[0], 1)) if rows else 0
+    amt = num(g(rows[0], 2)) if rows else 0
+    out = {"invoicesWithAddBack": int(n) if isinstance(n, float) else 0,
+           "addBack": round(amt, 2) if isinstance(amt, float) else 0.0}
+    log(f"[gate] post-as-of add-back: {out['invoicesWithAddBack']} invoices, "
+        f"{out['addBack']:,.2f}")
+    return out
+
+
+def q_ar(asof: str, boundary_id: int | None = None) -> str:
+    """AR aging detail, open as of `asof`.
+
+    Rule 1 supplies the open-at-as-of test. The as-of BALANCE is the header's
+    current unpaid amount plus anything paid AFTER as-of (a small bounded CTE —
+    ~3,328 docs — not the unbounded one that hangs), prorated across lines.
+    See _postpay_cte for the payment-date fallback `boundary_id` enables.
+    """
+    return f"""
+{_postpay_cte(asof, boundary_id)}
 SELECT
   BUILTIN.DF(t.entity) AS c01, t.trandate AS c02, BUILTIN.DF(t.type) AS c03,
   t.tranid AS c04, i.itemid AS c05, tl.quantity AS c06,
@@ -918,9 +1049,38 @@ def formula_cells(kind: str, first_row: int, count: int,
 
 def extract(mcp: Mcp, asof: str, frm: str, to: str,
             sign_flip: bool = True, log=print) -> dict:
-    log(f"[ar] querying open-at-{asof}")
-    ar_raw = mcp.rows(q_ar(asof), "AR aging")
+    # ---- gates that must run BEFORE anything is written (08.2026 lessons:
+    # every defect in the parallel run shipped because an empty result set
+    # looked like a valid answer)
+    boundary_id = fetch_boundary_id(mcp, asof, log=log)
+    vis = fetch_visibility(mcp, frm, to, log=log)
+    if vis.get("CashSale", 0) == 0:
+        raise ValueError(
+            f"NetSuite returned ZERO Cash Sale transactions for {frm}..{to}. "
+            "Every month has cash sales (08.2026: 188 docs, 73 with a partner, "
+            "$77K of commissionable billing) — the integration role is almost "
+            "certainly missing Transactions > Cash Sale (View). Refusing to run.")
+    if vis.get("CustPymt", 0) > 0:
+        payment_src = "payment trandate"
+    else:
+        payment_src = "id-boundary proxy"
+        log("[gate] WARNING: role cannot see Customer Payment records — "
+            "post-as-of payments are classified by record-id boundary "
+            f"({boundary_id}); grant Transactions > Customer Payment (View) "
+            "to use real payment dates")
+
+    log(f"[ar] querying open-at-{asof} (payment dates: {payment_src})")
+    ar_raw = mcp.rows(q_ar(asof, boundary_id), "AR aging")
     log(f"[ar] {len(ar_raw)} raw lines")
+    closed_after = sum(1 for r in ar_raw if g(r, 12) not in (None, ""))
+    postpay = fetch_postpay_check(mcp, asof, boundary_id, log=log)
+    if closed_after and postpay["addBack"] <= 0:
+        raise ValueError(
+            f"{closed_after} AR lines belong to invoices closed AFTER {asof}, "
+            "yet the post-as-of payment add-back is ZERO — the as-of balances "
+            "would collapse to run-day balances (08.2026: $122K of September "
+            "receipts booked as August). Refusing to run.")
+    postpay.update({"boundaryId": boundary_id, "closedAfterAsofLines": closed_after})
 
     log(f"[sales] id sweep {frm}..{to}")
     ids = [str(g(r, 1)) for r in mcp.rows(q_sales_ids(frm, to), "sales ids")]
@@ -969,6 +1129,12 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
         if isinstance(q, float):
             sku = str(g(r, 5))
             units_by_sku[sku] = units_by_sku.get(sku, 0.0) + q * sf0
+    # cash-sale presence in the SWEEP (the visibility gate above proves the
+    # role can see them; this says whether any carried a partner this month)
+    cash_lines = [r for r in sales_raw
+                  if str(g(r, 3) or "").strip().casefold() == "cash sale"]
+    cash_docs = {str(g(r, 14)) for r in cash_lines if g(r, 14)}
+    log(f"[sales] cash sales in sweep: {len(cash_docs)} docs / {len(cash_lines)} lines")
     ar_rows, ar_diag = build_ar_rows(ar_raw, cust, items, states, partners,
                                      accounts, sign_flip)
     del ar_raw
@@ -1005,6 +1171,10 @@ def extract(mcp: Mcp, asof: str, frm: str, to: str,
         "txnCount": len(ids),
         "newItems": new_items, "newItemsBasis": ni_basis,
         "diagnostics": {"ar": ar_diag, "sales": sales_diag,
+                        "visibility": vis, "paymentDateSource": payment_src,
+                        "postpay": postpay,
+                        "cashSaleDocs": len(cash_docs),
+                        "cashSaleLines": len(cash_lines),
                         "customers": len(cust), "employeeCodes": len(emp_codes),
                         "employeesUnmapped": unmapped,
                         "items": len(items), "states": len(states),

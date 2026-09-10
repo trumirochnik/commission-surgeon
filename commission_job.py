@@ -159,6 +159,21 @@ def build_ops(data: dict, spec: dict, prior_ar_tab: str | None = None
             for row in padded:
                 for col, t in tpl.items():
                     row[col_to_index(col) - 1] = t
+        # Idempotent append (08.2026 finding): the source book's raw tab
+        # already held the first days of the new month — Mike's July pull
+        # ran in early August — and a plain append duplicated 310 lines
+        # ($31K) in both September runs. Drop rows dated on/after the
+        # period start first, then append the whole month.
+        frm = spec.get("fromDate")
+        if frm:
+            from netsuite_extract import serial as _serial_date
+            frm_serial = _serial_date(frm)
+            if not isinstance(frm_serial, int):
+                raise ValueError(f"extract.fromDate {frm!r} is not a date")
+            ops.append({"op": "trim_rows", "sheet": raw["target"], "col": "F",
+                        "minValue": frm_serial,
+                        "firstRow": _anchor_row(raw.get("anchor", "A4"))})
+            report["rawTrimFromSerial"] = frm_serial
         ops.append({"op": "append_rows", "sheet": raw["target"], "rows": padded})
         report["formulaGaps"]["raw"] = [c for c in _span_cols(raw.get("formulaCols", ""))
                                        if c not in tpl]

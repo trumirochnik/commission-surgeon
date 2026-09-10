@@ -199,6 +199,21 @@ class XlsxSurgeon:
             raise KeyError(f"sheet {sheet!r} not found; have {self.sheet_names()}")
         self._ops.append(("append", sheet, (rows, styles)))
 
+    def trim_rows(self, sheet: str, col: str, min_value: float, first_row: int):
+        """Drop every data row (r >= first_row) whose column `col` holds a
+        NUMBER >= min_value, streaming — any sheet size. Built for the
+        cumulative 'Sales report Raw': the source book already carries the
+        first days of the new month (Mike's July pull ran in early August),
+        so a plain append duplicated 310 August lines ($31K) in BOTH
+        September runs. Trimming rows dated on/after the period start and
+        then appending the full month makes the append idempotent. Applied
+        before any append on the same part."""
+        if sheet not in self._sheet_parts:
+            raise KeyError(f"sheet {sheet!r} not found; have {self.sheet_names()}")
+        if not re.fullmatch(r"[A-Z]{1,3}", str(col)):
+            raise ValueError(f"trim_rows: bad column {col!r}")
+        self._ops.append(("trim", sheet, (str(col), float(min_value), int(first_row))))
+
     def add_sheet(self, name: str, rows: list, styles=None):
         if name in self._sheet_parts:
             raise KeyError(f"sheet {name!r} already exists")
@@ -440,11 +455,13 @@ class XlsxSurgeon:
             part = self._sheet_parts[target]
             per_part.setdefault(part, {"set": {}, "append": [], "paste": [],
                                        "retarget": [], "copyvals": [],
-                                       "replacef": []})
+                                       "replacef": [], "trim": []})
             if kind == "set":
                 per_part[part]["set"].update(payload[0])
             elif kind == "paste":
                 per_part[part]["paste"].append(payload)
+            elif kind == "trim":
+                per_part[part]["trim"].append(payload)
             elif kind == "retarget":
                 per_part[part]["retarget"].extend(payload)
             elif kind == "copyvals":
@@ -701,6 +718,7 @@ class XlsxSurgeon:
                     with zin.open(name) as f, open(tmp_in, "wb") as out:
                         shutil.copyfileobj(f, out, CHUNK)
                     tmp_out = os.path.join(self.workdir, "part_out.xml")
+                    self._last_trimmed = 0
                     changed = self._transform_sheet(
                         tmp_in, tmp_out,
                         per_part[name]["set"],
@@ -709,7 +727,8 @@ class XlsxSurgeon:
                         per_part[name].get("retarget", []),
                         retarget_key=part_to_name.get(name, name),
                         copyvals_groups=per_part[name].get("copyvals", []),
-                        replacef_groups=per_part[name].get("replacef", []))
+                        replacef_groups=per_part[name].get("replacef", []),
+                        trim_groups=per_part[name].get("trim", []))
                     # transforms only rewrite <row>/<c> content, which never
                     # carries r:id, and the part's own _rels streams through
                     # untouched — so no dangling-rid scan is needed here.
@@ -717,7 +736,8 @@ class XlsxSurgeon:
                                     "sheet": part_to_name.get(name, name),
                                     "target": part_to_name.get(name, name),
                                     "kind": "transform",
-                                    "cellsChanged": changed})
+                                    "cellsChanged": changed,
+                                    "rowsTrimmed": self._last_trimmed})
                     zi = zipfile.ZipInfo(name)
                     zi.compress_type = zipfile.ZIP_DEFLATED
                     with open(tmp_out, "rb") as f:
@@ -1064,10 +1084,67 @@ class XlsxSurgeon:
                 f'org/officeDocument/2006/relationships">'
                 f'<dimension ref="{dim}"/><sheetData>{body}</sheetData></worksheet>')
 
+    @staticmethod
+    def _stream_trim_rows(src: str, dst: str, col: str, min_value: float,
+                          first_row: int) -> int:
+        """Copy a sheet part to `dst`, dropping every row with r >= first_row
+        whose `col` cell is a plain NUMBER >= min_value. Streams in CHUNK
+        pieces and only ever holds one partial row in memory, so it is safe
+        on the 480k-row / 600MB 'Sales report Raw'. Rows whose `col` cell is
+        missing, a shared/inline string, boolean or error are kept. Row
+        numbers of kept rows are left as they are (OOXML allows gaps; on
+        the raw tab the trimmed rows are the tail, so the following append
+        continues contiguously). Returns the dropped-row count."""
+        row_re = re.compile(r'<row\b[^>]*?(?:/>|>.*?</row>)', re.S)
+        cell_re = re.compile(r'<c r="' + re.escape(col) + r'\d+"([^>]*?)(?:/>|>(.*?)</c>)', re.S)
+        v_re = re.compile(r'<v>([^<]*)</v>')
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        dropped = 0
+        buf = ""
+        with open(src, "rb") as fin, open(dst, "w", encoding="utf-8") as fout:
+            eof = False
+            while not eof:
+                b = fin.read(CHUNK)
+                eof = not b
+                buf += dec.decode(b, final=eof)
+                out: list[str] = []
+                pos = 0
+                for m in row_re.finditer(buf):
+                    out.append(buf[pos:m.start()])
+                    frag = m.group(0)
+                    keep = True
+                    open_tag = frag[:frag.find(">") + 1]
+                    rm = re.search(r'\br="(\d+)"', open_tag)
+                    if rm and int(rm.group(1)) >= first_row:
+                        cm = cell_re.search(frag)
+                        if cm and cm.group(2):
+                            tm = re.search(r'\bt="(\w+)"', cm.group(1))
+                            if tm is None or tm.group(1) == "n":
+                                vm = v_re.search(cm.group(2))
+                                if vm:
+                                    try:
+                                        if float(vm.group(1)) >= min_value:
+                                            keep = False
+                                    except ValueError:
+                                        pass
+                    if keep:
+                        out.append(frag)
+                    else:
+                        dropped += 1
+                    pos = m.end()
+                if out:
+                    fout.write("".join(out))
+                buf = buf[pos:]
+                # a buffer with no complete row can only be prefix (before
+                # the first row), suffix (after the last), or one partial
+                # row straddling the chunk boundary — all small, all kept
+            fout.write(buf)
+        return dropped
+
     def _transform_sheet(self, src, dst, set_cells, append_groups,
                          paste_groups=None, retarget_groups=None,
                          retarget_key=None, copyvals_groups=None,
-                         replacef_groups=None):
+                         replacef_groups=None, trim_groups=None):
         """
         Disk-based transform of one worksheet part.
         Strategy: the file is processed as head (first chunk, holds <dimension>),
@@ -1075,9 +1152,24 @@ class XlsxSurgeon:
         final rows + </sheetData> + autoFilter). set_cells requires a full parse,
         so it is only allowed on sheets small enough to hold in memory (< 32MB
         decompressed) — Dashboard-class sheets. Appends work on any size.
+        trim_rows runs FIRST, as its own streaming pass to a temp part that
+        then feeds whichever path below applies.
         """
         size = os.path.getsize(src)
         changed = 0
+        if trim_groups:
+            cur = src
+            dropped = 0
+            for i, (t_col, t_min, t_first) in enumerate(trim_groups):
+                out_p = os.path.join(self.workdir, f"part_trim{i % 2}.xml")
+                dropped += self._stream_trim_rows(cur, out_p, t_col, t_min, t_first)
+                cur = out_p
+            _mem_log(f"trim_rows dropped {dropped} rows "
+                     f"({round(size / 1048576, 1)} MB part)")
+            src = cur
+            size = os.path.getsize(src)
+            changed += dropped
+            self._last_trimmed = dropped
 
         # total-regeneration ops on an EXISTING sheet stream disk-to-disk,
         # any size — this is the 'New Sales report' path (13.5k-row paste +
