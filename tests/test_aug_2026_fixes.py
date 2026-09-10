@@ -221,8 +221,8 @@ with open(big_part, "w", encoding="utf-8") as f:
     f.write(f'</sheetData><autoFilter ref="A3:L{N + 3}"/></worksheet>')
 size_mb = os.path.getsize(big_part) / 1048576
 expected_drop = sum(1 for r in range(4, N + 4) if 46100 + (r % 200) >= 46235)
-dropped = XlsxSurgeon._stream_trim_rows(big_part, os.path.join(TD, "big_out.xml"),
-                                        "F", 46235.0, 4)
+dropped = s._stream_trim_rows(big_part, os.path.join(TD, "big_out.xml"),
+                              "F", 46235.0, 4)
 big_out = open(os.path.join(TD, "big_out.xml"), encoding="utf-8").read()
 check(f"T9 multi-chunk stream ({size_mb:.1f} MB) drops exactly the matching rows",
       dropped == expected_drop, (dropped, expected_drop))
@@ -246,6 +246,70 @@ check("T11 large part: trim+append re-pins dimension and autoFilter to last kept
       (re.findall(r'<dimension ref="[^"]*"', head), re.findall(r'<autoFilter ref="[^"]*"', tail), final))
 check("T12 large part: trimmed rows counted",
       getattr(s, "_last_trimmed", None) == expected_drop, getattr(s, "_last_trimmed", None))
+
+
+# ---------------------------------------------------------------- shared formulas (v52)
+# The v50 run shipped a book Excel would not open: trimming rows that held
+# shared-formula MASTERS orphaned 336 follower cells in 8 groups on the raw
+# tab. Fix: promote the first surviving follower to master with the text
+# re-anchored to its row.
+sf = XlsxSurgeon._shift_formula
+check("S1 relative refs shift by row", sf('TEXT(T5,"MMM YY")', 3) == 'TEXT(T8,"MMM YY")')
+check("S2 absolute row untouched, absolute col still shifts row", sf("$T$4+$T4+T$4", 2) == "$T$4+$T6+T$4")
+check("S3 sheet-qualified ref shifts; function names and whole columns do not",
+      sf("'AR_07.31'!T5+LOG10(A1)+SUM(AA:AA)", 1) == "'AR_07.31'!T6+LOG10(A2)+SUM(AA:AA)",
+      sf("'AR_07.31'!T5+LOG10(A1)+SUM(AA:AA)", 1))
+check("S4 text inside string literals is left alone", sf('IF(A1="A1","x",A1)', 1) == 'IF(A2="A1","x",A2)')
+check("S5 column delta", sf("H10-I10", 0, 2) == "J10-K10")
+
+sh_part = os.path.join(TD, "shared_src.xml")
+# rows 4..15: F dates; Z col shared group A (master row 4, ref Z4:Z9), group B (master row 10, ref Z10:Z15)
+# trim >= 46235 drops rows 4,5 (group A master + a follower) and row 12 (mid-group B follower)
+rows_xml = ['<row r="3"><c r="A3" t="inlineStr"><is><t>hdr</t></is></c></row>']
+fvals = {4: 46240, 5: 46236, 6: 46100, 7: 46101, 8: 46102, 9: 46103, 10: 46104, 11: 46105, 12: 46250, 13: 46106, 14: 46107, 15: 46108}
+for r in range(4, 16):
+    if r == 4:
+        fz = f'<f t="shared" ref="Z4:Z9" si="0">TEXT(T4,&quot;MMM YY&quot;)</f>'
+    elif r == 10:
+        fz = f'<f t="shared" ref="Z10:Z15" si="1">+CONCATENATE(H10,&quot; - &quot;,I10)</f>'
+    else:
+        fz = f'<f t="shared" si="{0 if r < 10 else 1}"/>'
+    rows_xml.append(f'<row r="{r}"><c r="F{r}"><v>{fvals[r]}</v></c><c r="T{r}"><v>46000</v></c>'
+                    f'<c r="Z{r}" t="str">{fz}<v>x</v></c></row>')
+with open(sh_part, "w", encoding="utf-8") as f:
+    f.write('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<dimension ref="A1:Z15"/><sheetData>' + "".join(rows_xml) + '</sheetData></worksheet>')
+sh_out = os.path.join(TD, "shared_out.xml")
+d2 = s._stream_trim_rows(sh_part, sh_out, "F", 46235.0, 4)
+so = open(sh_out, encoding="utf-8").read()
+masters = {m.group(2): m.group(1) for m in re.finditer(r'<f t="shared" ref="([^"]+)" si="(\d+)">', so)}
+follow = re.findall(r'<f t="shared" si="(\d+)"/>', so)
+check("S6 dropped exactly the 3 dated rows", d2 == 3, d2)
+check("S7 group A re-mastered at row 6 with its ref restarted there and text re-anchored",
+      masters.get("0") == "Z6:Z9"
+      and re.search(r'si="0">TEXT\(T6,(?:&quot;|")MMM YY(?:&quot;|")\)</f>', so) is not None
+      and "TEXT(T4," not in so, (masters, so[-900:]))
+check("S8 group B master kept untouched (only a follower was dropped)",
+      masters.get("1") == "Z10:Z15" and 'si="1">+CONCATENATE(H10,&quot; - &quot;,I10)</f>' in so, masters)
+check("S9 no orphan followers remain", set(follow) <= set(masters), (set(follow), set(masters)))
+check("S10 promotion count exposed", getattr(s, "_last_promoted", None) == 1, getattr(s, "_last_promoted", None))
+check("S11 rows 6-9 keep si=0 followers, rows 11,13-15 keep si=1",
+      follow.count("0") == 3 and follow.count("1") == 4, follow)
+
+# guard: a follower that can never get a master (its master is not in the
+# part at all) must FAIL the write, not ship an unopenable book
+bad_part = os.path.join(TD, "shared_bad.xml")
+with open(bad_part, "w", encoding="utf-8") as f:
+    f.write('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+            '<row r="4"><c r="F4"><v>46100</v></c><c r="Z4" t="str"><f t="shared" si="9"/><v>x</v></c></row>'
+            '</sheetData></worksheet>')
+try:
+    s._stream_trim_rows(bad_part, os.path.join(TD, "shared_bad_out.xml"), "F", 46235.0, 4)
+    check("S12 orphan follower with no master anywhere -> refuses to write", False, "no exception")
+except ValueError as e:
+    check("S12 orphan follower with no master anywhere -> refuses to write", "without a master" in str(e), e)
 
 
 # ---------------------------------------------------------------- build_ops

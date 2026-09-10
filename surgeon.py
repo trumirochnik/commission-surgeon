@@ -1084,24 +1084,100 @@ class XlsxSurgeon:
                 f'org/officeDocument/2006/relationships">'
                 f'<dimension ref="{dim}"/><sheetData>{body}</sheetData></worksheet>')
 
-    @staticmethod
-    def _stream_trim_rows(src: str, dst: str, col: str, min_value: float,
+    # A1-style reference inside a formula: optional $ on column and/or row.
+    # Not preceded by a name character (so LOG10( / a sheet name like
+    # AR_07 never match) and not followed by one or by "(" (function names).
+    _SHIFT_REF_RE = re.compile(r"(?<![A-Za-z0-9_.])(\$?)([A-Z]{1,3})(\$?)(\d{1,7})(?![0-9A-Za-z_(])")
+
+    @classmethod
+    def _shift_formula(cls, text: str, drow: int, dcol: int = 0) -> str:
+        """Re-anchor a formula's RELATIVE references by (drow, dcol), leaving
+        $-absolute parts and anything inside string literals alone. This is
+        how a shared formula's follower cell is materialized: the master's
+        text moved to the follower's position."""
+        parts = text.split('"')          # even indexes are outside quotes
+        for i in range(0, len(parts), 2):
+            def rep(m):
+                cabs, c, rabs, r = m.groups()
+                if not cabs and dcol:
+                    c = col_letter(col_index(c) + dcol)
+                if not rabs:
+                    r = str(int(r) + drow)
+                return f"{cabs}{c}{rabs}{r}"
+            parts[i] = cls._SHIFT_REF_RE.sub(rep, parts[i])
+        return '"'.join(parts)
+
+    def _stream_trim_rows(self, src: str, dst: str, col: str, min_value: float,
                           first_row: int) -> int:
         """Copy a sheet part to `dst`, dropping every row with r >= first_row
         whose `col` cell is a plain NUMBER >= min_value. Streams in CHUNK
         pieces and only ever holds one partial row in memory, so it is safe
         on the 480k-row / 600MB 'Sales report Raw'. Rows whose `col` cell is
         missing, a shared/inline string, boolean or error are kept. Row
-        numbers of kept rows are left as they are (OOXML allows gaps; on
-        the raw tab the trimmed rows are the tail, so the following append
-        continues contiguously). Returns the dropped-row count."""
+        numbers of kept rows are left as they are (OOXML allows gaps).
+
+        SHARED FORMULAS (the 2026-09-10 v50 run shipped a book Excel would
+        not open): Excel stores a run of identical formulas as one MASTER
+        cell (<f t="shared" ref="Z100:Z163" si="7">text</f>) plus FOLLOWERS
+        (<f t="shared" si="7"/>). The raw tab's Z:AC columns are ~29,500
+        such groups of 64 rows. Dropping a master's row orphans every
+        follower below it — 8 groups / 336 cells on that run — and Excel
+        refuses the file outright. So when a dropped row carries a master,
+        the FIRST surviving follower of that group is promoted to master:
+        its <f/> is rewritten with the master's text re-anchored to its own
+        row (and column) and the group's ref re-started there. Any orphan
+        still left at the end is a hard failure — better no file than one
+        nobody can open. Returns the dropped-row count."""
         row_re = re.compile(r'<row\b[^>]*?(?:/>|>.*?</row>)', re.S)
         cell_re = re.compile(r'<c r="' + re.escape(col) + r'\d+"([^>]*?)(?:/>|>(.*?)</c>)', re.S)
         v_re = re.compile(r'<v>([^<]*)</v>')
+        # any <f ...>...</f> or <f .../> whose attributes say t="shared"
+        f_re = re.compile(r'<f\b([^>]*?)(?:/>|>(.*?)</f>)', re.S)
+        c_open_re = re.compile(r'<c\b[^>]*\br="([A-Z]+)(\d+)"')
         dec = codecs.getincrementaldecoder("utf-8")("replace")
         dropped = 0
         buf = ""
-        with open(src, "rb") as fin, open(dst, "w", encoding="utf-8") as fout:
+        # si -> (master_row, master_col_index, ref_end_or_None, text) for
+        # masters that were on DROPPED rows and still need a new master
+        pending: dict[str, tuple] = {}
+        state = {"promoted": 0}
+        cell_re_any = re.compile(r'<c\b[^>]*\br="([A-Z]+)\d+"[^>]*?(?:/>|>.*?</c>)', re.S)
+        # every shared si that has a master in the OUTPUT vs every si a kept
+        # follower points at — any follower without a master is an orphan
+        # and Excel will refuse the whole workbook
+        masters_out: set[str] = set()
+        followers_out: set[str] = set()
+        shared_f_re = re.compile(r'<f\b[^>]*\bt="shared"[^>]*?(/>|>)')
+
+        def attrs(s):
+            return dict(re.findall(r'(\w+)="([^"]*)"', s))
+
+        def promote(cm_match, rnum):
+            """Rewrite one kept cell if it is the first surviving follower
+            of a group whose master was dropped."""
+            cell = cm_match.group(0)
+            fm = f_re.search(cell)
+            if not fm:
+                return cell
+            a = attrs(fm.group(1))
+            si = a.get("si")
+            if a.get("t") != "shared" or fm.group(2) is not None or si not in pending:
+                return cell
+            mrow, mcol, ref_end, text = pending.pop(si)
+            ccol_letters = cm_match.group(1)
+            new_text = self._xml_escape_text(self._shift_formula(
+                self._xml_unescape_text(text), rnum - mrow, col_index(ccol_letters) - mcol))
+            end = ref_end or f"{ccol_letters}{rnum}"
+            try:
+                if int(re.sub(r"[A-Z]+", "", end)) < rnum:
+                    end = f"{ccol_letters}{rnum}"
+            except ValueError:
+                end = f"{ccol_letters}{rnum}"
+            new_f = f'<f t="shared" ref="{ccol_letters}{rnum}:{end}" si="{si}">{new_text}</f>'
+            state["promoted"] += 1
+            return cell[:fm.start()] + new_f + cell[fm.end():]
+
+        with open(src, "rb") as fin, open(dst, "w", encoding="utf-8", newline="") as fout:
             eof = False
             while not eof:
                 b = fin.read(CHUNK)
@@ -1115,7 +1191,8 @@ class XlsxSurgeon:
                     keep = True
                     open_tag = frag[:frag.find(">") + 1]
                     rm = re.search(r'\br="(\d+)"', open_tag)
-                    if rm and int(rm.group(1)) >= first_row:
+                    rnum = int(rm.group(1)) if rm else 0
+                    if rm and rnum >= first_row:
                         cm = cell_re.search(frag)
                         if cm and cm.group(2):
                             tm = re.search(r'\bt="(\w+)"', cm.group(1))
@@ -1127,6 +1204,27 @@ class XlsxSurgeon:
                                             keep = False
                                     except ValueError:
                                         pass
+                    if "shared" in frag:
+                        if not keep:
+                            # remember every master this dropped row carried
+                            for fm in f_re.finditer(frag):
+                                a = attrs(fm.group(1))
+                                if a.get("t") == "shared" and fm.group(2) is not None and a.get("si") is not None:
+                                    head = frag[:fm.start()]
+                                    cm2 = c_open_re.search(head[head.rfind("<c"):])
+                                    mcol = col_index(cm2.group(1)) if cm2 else 0
+                                    ref = a.get("ref") or ""
+                                    ref_end = ref.split(":")[1] if ":" in ref else None
+                                    pending[a["si"]] = (rnum, mcol, ref_end, fm.group(2))
+                        elif pending:
+                            # promote the first surviving follower of each
+                            # orphaned group to be its new master
+                            frag = cell_re_any.sub(lambda cm_match: promote(cm_match, rnum), frag)
+                        if keep:
+                            for fm in f_re.finditer(frag):
+                                a = attrs(fm.group(1))
+                                if a.get("t") == "shared" and a.get("si") is not None:
+                                    (masters_out if fm.group(2) is not None else followers_out).add(a["si"])
                     if keep:
                         out.append(frag)
                     else:
@@ -1139,6 +1237,15 @@ class XlsxSurgeon:
                 # the first row), suffix (after the last), or one partial
                 # row straddling the chunk boundary — all small, all kept
             fout.write(buf)
+        orphans = followers_out - masters_out
+        if orphans:
+            raise ValueError(
+                f"trim_rows would leave {len(orphans)} shared-formula group(s) "
+                f"without a master (si {sorted(orphans)[:8]}) — Excel refuses such "
+                "a workbook; refusing to write it")
+        # a dropped master whose group has no surviving follower needs
+        # nothing: no cell references that si any more
+        self._last_promoted = state["promoted"]
         return dropped
 
     def _transform_sheet(self, src, dst, set_cells, append_groups,

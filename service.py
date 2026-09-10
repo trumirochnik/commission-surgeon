@@ -1518,7 +1518,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-09-10-v51-creditmemo-balances"
+VERSION = "2026-09-10-v52-trim-shared-formulas"
 
 
 @app.get("/health")
