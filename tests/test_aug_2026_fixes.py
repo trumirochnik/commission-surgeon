@@ -61,6 +61,12 @@ check("Q7 AR aging pull excludes Cash Sales (they never get a closedate)",
       and "'CustCred'" in _ar_where, _ar_where[:400])
 check("Q8 the SALES sweep still includes Cash Sales",
       "'CashSale'" in ne.q_sales_ids("2026-08-01", "2026-08-31"))
+# 08.2026 second run: 57 open credit memos carried L=0 (Preet: their negative
+# remaining credit). Credit memos have no foreignamountunpaid; the remaining
+# credit is foreignpaymentamountunused (positive vs a negative total).
+check("Q9 credit-memo balance uses foreignpaymentamountunused, full total if closed after as-of",
+      "WHEN t.type = 'CustCred'" in q and "-NVL(t.foreignpaymentamountunused,0)" in q
+      and "t.closedate > TO_DATE('2026-08-31','YYYY-MM-DD') THEN t.foreigntotal" in q, q[-1500:])
 
 
 # ---------------------------------------------------------------- gates

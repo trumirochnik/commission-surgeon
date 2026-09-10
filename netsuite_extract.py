@@ -415,7 +415,16 @@ def q_ar(asof: str, boundary_id: int | None = None) -> str:
 SELECT
   BUILTIN.DF(t.entity) AS c01, t.trandate AS c02, BUILTIN.DF(t.type) AS c03,
   t.tranid AS c04, i.itemid AS c05, tl.quantity AS c06,
-  ROUND(tl.foreignamount * (NVL(hl.foreignamountunpaid,0) + NVL(pp.post_amt,0))
+  ROUND(tl.foreignamount * (
+          CASE WHEN t.type = 'CustCred' THEN
+            -- credit memos have NO foreignamountunpaid; the remaining
+            -- (unapplied) credit is foreignpaymentamountunused, positive
+            -- against a negative total. Fully applied after as-of => the
+            -- whole memo was still open at as-of. 08.2026: 57 open memos
+            -- shipped at 0 instead of their negative balance ($5.3K of AR).
+            CASE WHEN t.closedate > TO_DATE('{asof}','YYYY-MM-DD') THEN t.foreigntotal
+                 ELSE -NVL(t.foreignpaymentamountunused,0) END
+          ELSE NVL(hl.foreignamountunpaid,0) + NVL(pp.post_amt,0) END)
         / NULLIF(t.foreigntotal,0), 2) AS c07,
   BUILTIN.DF(t.employee) AS c08, BUILTIN.DF(t.partner) AS c09,
   BUILTIN.DF(t.status) AS c10, t.duedate AS c11, t.closedate AS c12,
