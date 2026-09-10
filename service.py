@@ -1469,7 +1469,7 @@ def _run(job_id: str, job: Job):
         _persist_jobs()
 
 
-VERSION = "2026-09-10-v48-aug-parallel-fixes"
+VERSION = "2026-09-10-v49-ar-no-cashsale"
 
 
 @app.get("/health")

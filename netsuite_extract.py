@@ -105,6 +105,13 @@ STORE_TYPES = (
 )
 ITEM_TYPES = ("Assembly", "Discount", "InvtPart")
 TXN_TYPES = ("CustInvc", "CashSale", "CustCred")
+# The AR AGING pull is invoices + credit memos only. Cash sales are paid at
+# the till and NEVER get a closedate, so the open-at-as-of test admits every
+# cash sale since the history start — invisible until the role gained Cash
+# Sale View (2026-09-10), then 27,705 docs / 87,430 zero-balance lines
+# flooded the AR query past SuiteQL's 99,000-row paging limit. Preet's AR
+# tab: Invoice 12,648 / Credit Memo 47 / Cash Sale 0.
+AR_TXN_TYPES = ("CustInvc", "CustCred")
 # Lower bound on the AR pull's trandate. 2022-10-01 dropped a still-OPEN
 # 2022-09-07 credit memo (179025, Tiffany, -22.50) that the hand-built
 # 08.2026 book carries — the only listed-partner document older than the
@@ -418,7 +425,7 @@ JOIN transactionline tl ON tl.transaction = t.id AND tl.mainline = 'F'
 JOIN item i ON i.id = tl.item
 LEFT JOIN transactionline hl ON hl.transaction = t.id AND hl.mainline = 'T'
 LEFT JOIN postpay pp ON pp.tid = t.id
-WHERE t.type IN ({sql_list(TXN_TYPES)})
+WHERE t.type IN ({sql_list(AR_TXN_TYPES)})
   AND t.trandate >= TO_DATE('{AR_HISTORY_START}','YYYY-MM-DD')
   AND t.trandate <= TO_DATE('{asof}','YYYY-MM-DD')
   AND (t.closedate IS NULL OR t.closedate > TO_DATE('{asof}','YYYY-MM-DD'))

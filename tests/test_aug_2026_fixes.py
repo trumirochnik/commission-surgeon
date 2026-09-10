@@ -52,6 +52,15 @@ check("Q6 boundary query keys on createddate before next month",
       "createddate < TO_DATE('2026-09-01'" in ne.q_boundary_id("2026-09-01"))
 check("H1 AR history window covers the 2022-09-07 open credit memo",
       ne.AR_HISTORY_START <= "2022-09-07", ne.AR_HISTORY_START)
+# first v48 run (2026-09-10) died with "offset out of bounds (0..99000)": the
+# role could suddenly see cash sales, which never close, so q_ar admitted
+# 27,705 of them (87,430 lines). AR aging = invoices + credit memos only.
+_ar_where = q[q.index("FROM transaction t"):]
+check("Q7 AR aging pull excludes Cash Sales (they never get a closedate)",
+      "'CashSale'" not in _ar_where and "'CustInvc'" in _ar_where
+      and "'CustCred'" in _ar_where, _ar_where[:400])
+check("Q8 the SALES sweep still includes Cash Sales",
+      "'CashSale'" in ne.q_sales_ids("2026-08-01", "2026-08-31"))
 
 
 # ---------------------------------------------------------------- gates
